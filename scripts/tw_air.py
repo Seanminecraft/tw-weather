@@ -431,10 +431,8 @@ def append_index(out, man):
                    '<a href="%s"><img loading="lazy" src="%s" alt="%s 鄉鎮"></a></div>' % (
                        v["name"], v["img"]["station"], v["img"]["station"], v["name"], v["img"]["town"], v["img"]["town"], v["name"])
                    for v in man["vars"])
-    sec = ('<!--tw-air--><h1>🌫️ 全台空氣品質</h1><p>監測時間：%s（臺灣時間）｜每小時更新｜資料來源：環境部（aqx_p_432）｜鄉鎮規則：%s</p>'
-           '<p>JSON：<a href="air.json">air.json</a>、<a href="data/air/latest.json">data/air/latest.json</a>、'
-           '<a href="data/air/towns.json">data/air/towns.json</a>、<a href="data/air/counties.json">data/air/counties.json</a>、'
-           '<a href="img/history_aq/index.json">img/history_aq/index.json</a></p><div class="g">%s</div><p>%s。</p>') % (
+    sec = ('<!--tw-air--><h1>🌫️ 全台空氣品質</h1><p>監測時間：%s（臺灣時間）｜每小時更新｜資料來源：環境部｜鄉鎮規則：%s</p>'
+           '<div class="g">%s</div><p>%s。</p>') % (
         man["obsTime"][:16].replace("T", " "), AIR_RULE, rows, AIR_DISCLAIMER)
     html = html.replace("</body>", sec + "</body>")
     open(p, "w", encoding="utf-8").write(html)

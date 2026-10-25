@@ -182,7 +182,7 @@ def build(a):
     towns = W.town_table()
     tagg = W.aggregate_towns(stations, towns)
     times = {"frame": iso(T), "rain": iso(T), "generated": iso(now_tpe())}
-    srcs_label = "中央氣象署 O-A0002（S3 公開鏡像）" if src in ("S3", "cache", "S3(舊)") else "中央氣象署開放資料（S3／檔案下載 API）"
+    srcs_label = "中央氣象署"   # v22.4：圖上只寫資料來源（實際抓取方式見 log）
     v = next(x for x in W.VARS if x["key"] == "r10m")
     rd = renderer(a.logo)
     fk = k10(T)

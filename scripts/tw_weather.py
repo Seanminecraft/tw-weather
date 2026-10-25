@@ -721,12 +721,10 @@ def write_index_html(out, man):
                     '<a href="%s"><img loading="lazy" src="%s" alt="%s 鄉鎮"></a></div>' % (
                         v["name"], v["img"]["station"], v["img"]["station"], v["name"], v["img"]["town"], v["img"]["town"], v["name"]))
     html = """<!doctype html><html lang="zh-TW"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>全台天氣觀測圖（tw-weather）</title><style>body{font-family:system-ui,'Noto Sans TC',sans-serif;margin:16px;background:#0f172a;color:#e2e8f0}
+<title>全台天氣觀測圖</title><style>body{font-family:system-ui,'Noto Sans TC',sans-serif;margin:16px;background:#0f172a;color:#e2e8f0}
 a{color:#7dd3fc}.g{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:14px}.v{background:#1e293b;border-radius:10px;padding:8px}
 .v img{width:49%%;border-radius:6px}h3{margin:4px 0 8px;font-size:15px}</style></head><body>
-<h1>🗺️ 全台天氣觀測圖</h1><p>觀測時間：%s（臺灣時間）｜每小時更新｜資料：中央氣象署開放資料（S3 公開鏡像）</p>
-<p>JSON：<a href="manifest.json">manifest.json</a>、<a href="data/latest.json">data/latest.json</a>、<a href="data/towns.json">data/towns.json</a>、
-<a href="data/counties.json">data/counties.json</a>、<a href="img/history/index.json">img/history/index.json</a></p>
+<h1>🗺️ 全台天氣觀測圖</h1><p>觀測時間：%s（臺灣時間）｜每小時更新｜資料來源：中央氣象署</p>
 <div class="g">%s</div><p>%s。</p></body></html>""" % (man["obsTime"][:16].replace("T", " "), "".join(rows), DISCLAIMER)
     open(os.path.join(out, "index.html"), "w", encoding="utf-8").write(html)
 
@@ -826,8 +824,7 @@ def build(a):
     hist_dir = os.path.join(out, "img", "history", fk)
     os.makedirs(os.path.join(out, "img", "latest"), exist_ok=True)
     os.makedirs(hist_dir, exist_ok=True)
-    srcs_label = "中央氣象署 O-A0001／O-A0003／O-A0002（S3 公開鏡像）" if all(v in ("S3", "cache", "S3(舊)") for v in src.values()) else \
-        "中央氣象署開放資料（S3／檔案下載 API）"
+    srcs_label = "中央氣象署"   # v22.4：圖上只寫資料來源，不寫資料集代碼／抓取方式（實際來源記在 manifest.json 的 sources）
     img_bytes = 0
     for v in VARS:
         for style in ("station", "town"):

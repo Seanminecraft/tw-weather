@@ -2,7 +2,7 @@
 
 AIR_VERSION = "tw-air 1.0"
 AIR_DISCLAIMER = "空氣品質資料僅供參考，請依環境部發布為準，並勿作為重大決策使用"
-AIR_SOURCE = "環境部 空氣品質指標 AQX_P_432（每小時）"
+AIR_SOURCE = "環境部（每小時）"   # v22.4：圖上不寫資料集代碼
 AIR_SOURCE_SHORT = "環境部"
 
 # 環境部 AQI 官方顏色（良好、普通、對敏感族群不健康、對所有族群不健康、非常不健康、危害）
