@@ -1,0 +1,24 @@
+# 防止「60 天沒有 commit → GitHub 自動停用排程」：每週把 tw-weather 工作流程重新啟用一次（不產生 commit）
+name: keepalive
+
+on:
+  schedule:
+    - cron: '29 4 * * 1'   # 每週一 04:29 UTC（臺灣 12:29）
+  workflow_dispatch:
+
+permissions:
+  actions: write
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: 重新啟用排程工作流程
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          for wf in tw-weather.yml keepalive.yml; do
+            gh api --method PUT "/repos/$REPO/actions/workflows/$wf/enable" && echo "✅ $wf 已確認啟用"
+          done
