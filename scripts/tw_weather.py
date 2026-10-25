@@ -435,6 +435,163 @@ def parse_warnings(doc1, doc2):
     return {"sent": sent, "counties": out, "texts": texts}
 
 
+# ---------- v22.1：鄉鎮級警特報（CAP 檔，S3 公開鏡像，不用金鑰）----------
+CAP_FILES = ["W-C0033-003", "W-C0033-004", "W-C0033-005", "W-C0033-006", "W-C0033-010", "W-C0034-001"]
+
+
+def hz_key(s):
+    s = str(s or "")
+    for k, pat in (("ty", "颱風"), ("rain", "雨"), ("wind", "風"), ("cold", "低溫"), ("heat", "高溫"), ("fog", "霧")):
+        if pat in s:
+            return k
+    if "寒" in s:
+        return "cold"
+    if "熱" in s:
+        return "heat"
+    return "other"
+
+
+def fetch_caps(raw_dir=None):
+    """回傳 {檔名: XML 文字}；失敗的檔案略過"""
+    out = {}
+
+    def get(f):
+        p = os.path.join(raw_dir, "cap", f + ".cap") if raw_dir else None
+        if p and os.path.exists(p):
+            return f, open(p, encoding="utf-8").read()
+        try:
+            t = http_get(S3 + "Warning/" + f + ".cap", timeout=25).decode("utf-8")
+            if p:
+                os.makedirs(os.path.dirname(p), exist_ok=True)
+                open(p, "w", encoding="utf-8").write(t)
+            return f, t
+        except Exception as e:
+            log("⚠️ CAP %s 讀取失敗：%s" % (f, mask(e)))
+            return f, None
+
+    with cf.ThreadPoolExecutor(6) as ex:
+        for f, t in ex.map(get, CAP_FILES):
+            if t:
+                out[f] = t
+    return out
+
+
+def split_area(desc):
+    s = norm_name(desc)
+    for c in COUNTY_ORDER:
+        if s.startswith(c):
+            return c, s[len(c):]
+    return "", ""
+
+
+def parse_caps(caps, now=None):
+    """CAP 1.2 → [{hk, ph, lvl, prio, start, end, upcoming, areas:[{c,t}]}]（略過 Cancel／解除／已過期）"""
+    import xml.etree.ElementTree as ET
+    now = now or now_tpe()
+    out = []
+
+    def tag(e):
+        return e.tag.split("}")[-1]
+
+    def kid(e, name):
+        for x in e.iter():
+            if tag(x) == name:
+                return (x.text or "").strip()
+        return ""
+
+    for fname, txt in sorted((caps or {}).items()):
+        try:
+            root = ET.fromstring(txt.encode("utf-8"))
+        except Exception as e:
+            log("⚠️ CAP %s 解析失敗：%s" % (fname, e))
+            continue
+        msg = ""
+        for x in root:
+            if tag(x) == "msgType":
+                msg = (x.text or "").strip()
+        if msg == "Cancel":
+            continue
+        for info in [x for x in root if tag(x) == "info"]:
+            head, ev = kid(info, "headline"), kid(info, "event")
+            par = {}
+            for p in [x for x in info if tag(x) == "parameter"]:
+                par[kid(p, "valueName")] = kid(p, "value")
+            start = kid(info, "onset") or kid(info, "effective")
+            end = kid(info, "expires")
+            if "解除" in head:
+                continue
+            te = parse_t(end) if end else None
+            if te and te < now:
+                continue
+            ts = parse_t(start) if start else None
+            title = par.get("alert_title") or head or ev
+            col = par.get("alert_color") or ""
+            hk = hz_key(title + ev)
+            prio = ("ty" if hk == "ty" else "purple" if "紫" in col else "red" if "紅" in col else "orange" if "橙" in col
+                    else "yellow" if "黃" in col else ("red" if "豪雨" in title else "orange" if "大雨" in title else "yellow"))
+            areas = []
+            for a in [x for x in info if tag(x) == "area"]:
+                c, t = split_area(kid(a, "areaDesc"))
+                if c:
+                    areas.append({"c": c, "t": t})
+            if areas:
+                out.append({"file": fname, "hk": hk, "ph": title, "lvl": par.get("severity_level", ""), "prio": prio,
+                            "start": start, "end": end, "upcoming": bool(ts and ts > now), "areas": areas})
+    return out
+
+
+def merge_caps(counties, caps):
+    """把 CAP 的鄉鎮範圍併進 W-C0033-001 的縣市清單（同一種災害＝同一筆，補 towns；001 沒有的就新增 capOnly）"""
+    out = {}
+    for c in COUNTY_ORDER:
+        out[c] = []
+        for w in (counties.get(c) or []):
+            ts = parse_t(w.get("start")) if w.get("start") else None
+            out[c].append(dict(w, hk=hz_key(w.get("ph")), upcoming=bool(ts and ts > now_tpe())))
+    for cap in caps:
+        by = {}
+        for a in cap["areas"]:
+            o = by.setdefault(a["c"], {"all": False, "towns": []})
+            if not a["t"]:
+                o["all"] = True
+            elif a["t"] not in o["towns"]:
+                o["towns"].append(a["t"])
+        for c, o in by.items():
+            lst = out.setdefault(c, [])
+            towns = None if o["all"] else o["towns"]
+            ex = next((w for w in lst if w.get("hk") == cap["hk"] and not w.get("_cap")), None)
+            if ex is not None:
+                if towns:
+                    ex["towns"] = towns
+                ex["prio"] = cap["prio"]
+                ex["lvl"] = cap["lvl"]
+                ex["_cap"] = True
+                ex["end"] = ex.get("end") or cap["end"]
+            else:
+                lst.append({"ph": cap["ph"], "sig": "", "start": cap["start"], "end": cap["end"], "sub": [], "towns": towns,
+                            "prio": cap["prio"], "lvl": cap["lvl"], "hk": cap["hk"], "_cap": True, "capOnly": True,
+                            "upcoming": cap["upcoming"]})
+    return out
+
+
+def town_warn_index(counties, towns_geo):
+    """鄉鎮代碼 → [{ph, prio, upcoming}]（縣市級＝全縣市鄉鎮）"""
+    by_name, by_c = {}, {}
+    for t in towns_geo:
+        by_name[(norm_name(t["c"]), norm_name(t["t"]))] = t["code"]
+        by_c.setdefault(norm_name(t["c"]), []).append(t["code"])
+    ix = {}
+    for c, lst in counties.items():
+        for w in lst:
+            tw = w.get("towns") or []
+            codes = [by_name.get((norm_name(c), norm_name(x))) for x in tw]
+            codes = [x for x in codes if x] or by_c.get(norm_name(c), [])
+            for k in codes:
+                ix.setdefault(k, []).append({"ph": w.get("ph"), "prio": w.get("prio"), "upcoming": bool(w.get("upcoming")),
+                                             "end": w.get("end")})
+    return ix
+
+
 def parse_forecast36(doc):
     out = {}
     if not doc:
@@ -645,6 +802,15 @@ def build(a):
     towns = town_table()
     tagg = aggregate_towns(stations, towns)
     warn = parse_warnings(docs.get("W-C0033-001"), docs.get("W-C0033-002"))
+    try:   # v22.1：鄉鎮級（CAP）
+        caps = parse_caps(fetch_caps(raw_dir))
+        warn["c001"] = warn["counties"]
+        warn["caps"] = caps
+        warn["counties"] = merge_caps(warn["counties"], caps)
+        warn["towns"] = town_warn_index(warn["counties"], towns)
+        log("⚠️ CAP 鄉鎮級警特報 %d 則，影響 %d 個鄉鎮" % (len(caps), len(warn["towns"])))
+    except Exception as e:
+        log("⚠️ CAP 處理失敗（只用縣市級）：%s" % mask(e))
     fc36, fc_issue = parse_forecast36(docs.get("F-C0032-001"))
     counties = county_summary(stations, tagg, warn, fc36)
     gen = now_tpe()

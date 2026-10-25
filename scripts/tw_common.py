@@ -2,7 +2,7 @@
 import datetime as dt
 import os
 
-SCRIPT_VERSION = "tw-weather 1.0"
+SCRIPT_VERSION = "tw-weather 1.1"
 TPE = dt.timezone(dt.timedelta(hours=8))
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
