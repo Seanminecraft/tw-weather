@@ -1,0 +1,115 @@
+# 🗺️ 全台天氣觀測圖 → GitHub Pages（tw-weather）
+# 觸發：
+#   ① cron 每小時 :20（主要；整點觀測資料通常 :10 前上 S3）
+#   ② cron 每小時 :50（備援；GitHub 排程常延遲）——線上 manifest 已是這個整點就直接結束，不安裝套件、不部署
+#   ③ Actions 頁面手動按 Run workflow
+# 資料：氣象署 S3 公開鏡像（不用金鑰、不吃配額）；S3 失敗才用 secrets.CWA_API_KEY 打檔案下載 API（不設也能跑，絕不會印出）
+# 48 小時歷史：存在 GitHub Pages 網站裡（每次先下載上一版再加上新的一小時），不會 commit，repo 不會變大
+# 輸出：https://<帳號>.github.io/tw-weather/manifest.json、img/latest/<變數>_<station|town>.png（固定網址）
+name: tw-weather
+
+on:
+  schedule:
+    - cron: '20,50 * * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: '就算線上已是最新也重新產生（測試用）'
+        type: boolean
+        default: false
+
+concurrency:
+  group: tw-weather
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      skip: ${{ steps.quick.outputs.skip }}
+    steps:
+      - name: 取得程式碼
+        uses: actions/checkout@v7
+
+      - name: 讀取 GitHub Pages 網址
+        id: pages
+        uses: actions/configure-pages@v6
+
+      # 只用內建 python3：抓 S3 自動站資料 → 和線上 manifest 的整點比對；一樣就結束
+      - name: 快速檢查（線上已是最新就略過）
+        id: quick
+        env:
+          PAGES_BASE: ${{ steps.pages.outputs.base_url }}/
+          CWA_API_KEY: ${{ secrets.CWA_API_KEY }}
+          IN_FORCE: ${{ inputs.force }}
+        run: |
+          ARGS="--check --out site"
+          if [ "$IN_FORCE" = "true" ]; then ARGS="$ARGS --force"; fi
+          python3 scripts/tw_weather.py $ARGS
+
+      - name: 安裝 Python 3.12（含 pip 快取）
+        if: steps.quick.outputs.skip != 'true'
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: 中文字型快取
+        if: steps.quick.outputs.skip != 'true'
+        uses: actions/cache@v6
+        with:
+          path: fonts
+          key: tw-weather-notosanstc-v1
+
+      - name: 下載中文字型（快取沒有才下載）
+        if: steps.quick.outputs.skip != 'true'
+        run: |
+          mkdir -p fonts
+          for w in Regular Bold; do
+            [ -s "fonts/NotoSansTC-$w.otf" ] || curl -fsSL --retry 3 -o "fonts/NotoSansTC-$w.otf" \
+              "https://github.com/notofonts/noto-cjk/raw/main/Sans/SubsetOTF/TC/NotoSansTC-$w.otf"
+          done
+          ls -la fonts
+
+      - name: 安裝套件
+        if: steps.quick.outputs.skip != 'true'
+        run: pip install -r requirements.txt
+
+      - name: 產生資料與圖片
+        if: steps.quick.outputs.skip != 'true'
+        env:
+          PAGES_BASE: ${{ steps.pages.outputs.base_url }}/
+          CWA_API_KEY: ${{ secrets.CWA_API_KEY }}
+          MPLBACKEND: Agg
+        run: python scripts/tw_weather.py --out site
+
+      - name: 網站大小
+        if: steps.quick.outputs.skip != 'true'
+        run: du -sh site site/img/history site/data || true
+
+      - name: 打包網站
+        if: steps.quick.outputs.skip != 'true'
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    if: needs.build.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: 部署到 GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5
