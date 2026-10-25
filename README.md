@@ -16,7 +16,7 @@ GitHub Actions 每小時從 **中央氣象署開放資料的 S3 公開鏡像** �
 | 測站資料 | `data/latest.json` |
 | 鄉鎮彙整 | `data/towns.json` |
 | 縣市摘要（含警特報、36 小時預報） | `data/counties.json` |
-| 警特報 | `data/warnings.json` |
+| 警特報（含 CAP 鄉鎮級範圍，v1.1） | `data/warnings.json`：`counties`／`texts`（W-C0033-001 縣市級）＋`caps`（每則 CAP 的類別、燈號、起訖時間、影響鄉鎮代碼）＋`towns`（鄉鎮代碼 → 生效中警特報） |
 | 各縣市 48 小時序列 | `data/history/c/<縣市代碼>.json` |
 | 歷史影格（WebP） | `img/history/<YYYYMMDDHH>/<變數>_<town|station>.webp`、清單 `img/history/index.json` |
 
@@ -24,6 +24,7 @@ GitHub Actions 每小時從 **中央氣象署開放資料的 S3 公開鏡像** �
 `p` 海平面氣壓、`ws` 平均風、`wsx` 今日最大平均風、`wd` 風向、`g` 最大陣風（逐時）、`gx` 今日最大陣風。
 
 規則：
+- 警特報：每小時從 S3 鏡像讀 `W-C0033-001`（縣市級）與 CAP 檔（`Warning/W-C0033-003～006、-010、W-C0034-001.cap`），解析 CAP 的 `geocode`（鄉鎮代碼），所以陸上強風、大雨等只會畫在真正受影響的鄉鎮；CAP 讀不到時退回縣市級。尚未開始的（`onset` 在未來）標記為 `upcoming`。
 - 「今日」從臺灣時間 00:00 起算。
 - 鄉鎮面量圖：雨量、平均風、陣風、最高溫取鄉鎮內各站 **最大值**；最低溫取 **最小值**；目前氣溫與氣壓取 **海拔最低的測站**；風向取平均風最強測站的風向。鄉鎮內沒有測站資料就畫灰色斜線（不拿鄰近鄉鎮代替）。
 - 海平面氣壓由測站氣壓換算，海拔 500 m 以上測站不列入。
