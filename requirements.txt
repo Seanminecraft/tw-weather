@@ -1,0 +1,5 @@
+# 全台天氣觀測圖（GitHub Actions 用；Python 3.12）
+matplotlib>=3.9,<4
+shapely>=2.0
+pillow>=11
+numpy>=2.0
