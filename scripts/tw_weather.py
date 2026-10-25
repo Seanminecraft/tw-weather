@@ -897,7 +897,26 @@ def check(a):
         except Exception as e:
             log("ℹ️ 讀不到線上 manifest：", e)
     skip = (online == iso(T)) and not a.force
+    if skip and os.environ.get("MOENV_API_KEY", "").strip():   # v22.2：天氣已是最新、但空品還不是這個整點 → 照樣跑（不呼叫環境部）
+        try:
+            from tw_air import needs_update
+            if needs_update(a.pages_base):
+                skip = False
+                log("🌫️ 線上空品還不是這個整點 → 需要更新")
+        except Exception as e:
+            log("ℹ️ 空品檢查略過：", e)
     log("🔎 S3 觀測整點 %s｜線上 %s → %s" % (iso(T), online, "略過（已是最新）" if skip else "需要更新"))
+    mode = "skip" if skip else "full"
+    if skip and online:   # v22.3：每小時資料已是最新，但 10 分鐘雨量有新的 10 分鐘 → 只更新 r10m（mode=r10）
+        try:
+            from tw_r10 import needs_update as r10_needs
+            need, s3t, on = r10_needs(a.pages_base, raw_dir)
+            log("🌧️ S3 10 分鐘雨量 %s｜線上 %s → %s" % (s3t, on, "只更新 10 分鐘雨量" if need else "略過"))
+            if need:
+                skip, mode = False, "r10"
+        except Exception as e:
+            log("ℹ️ 10 分鐘雨量檢查略過：", mask(e))
+    gh_output("mode", mode)
     gh_output("skip", "true" if skip else "false")
     gh_output("frame", fkey(T))
 
