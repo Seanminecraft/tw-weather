@@ -6,11 +6,17 @@
 # 資料：氣象署 S3 公開鏡像（不用金鑰、不吃配額）；S3 失敗才用 secrets.CWA_API_KEY 打檔案下載 API（不設也能跑，絕不會印出）
 # 48 小時歷史：存在 GitHub Pages 網站裡（每次先下載上一版再加上新的一小時），不會 commit，repo 不會變大
 # 輸出：https://<帳號>.github.io/tw-weather/manifest.json、img/latest/<變數>_<station|town>.png（固定網址）
+# v22.2 空品：air.json、img/latest/aq_<項目>_<station|town>.png、img/history_aq/（48h）；secrets.MOENV_API_KEY
+# v22.3 10 分鐘雨量：cron 每 10 分鐘（:07 :17 … :57；S3 約晚 6 分鐘上檔）。每次自己判斷要做什麼：
+#   full ＝ 新的整點（或空品還沒更新）→ 全部重做（和以前一樣）＋ r10
+#   r10  ＝ 整點已是最新、只有 10 分鐘雨量是新的 → 沿用上一版網站（Actions artifact）只重畫 r10m 兩張圖＋資料
+#   skip ＝ 都是最新 → 約 15 秒結束，不部署
+#   上一版網站從「上一次的 github-pages artifact」取得（不吃 Pages 流量）；拿不到 → 自動改成 full
 name: tw-weather
 
 on:
   schedule:
-    - cron: '20,50 * * * *'
+    - cron: '7,17,27,37,47,57 * * * *'     # v22.3（原本 '20,50 * * * *'）
   workflow_dispatch:
     inputs:
       force:
@@ -24,6 +30,7 @@ concurrency:
 
 permissions:
   contents: read
+  actions: read          # v22.3：讀上一次的 github-pages artifact（只讀）
 
 jobs:
   build:
@@ -31,6 +38,7 @@ jobs:
     timeout-minutes: 20
     outputs:
       skip: ${{ steps.quick.outputs.skip }}
+      mode: ${{ steps.quick.outputs.mode }}
     steps:
       - name: 取得程式碼
         uses: actions/checkout@v7
@@ -45,6 +53,7 @@ jobs:
         env:
           PAGES_BASE: ${{ steps.pages.outputs.base_url }}/
           CWA_API_KEY: ${{ secrets.CWA_API_KEY }}
+          MOENV_API_KEY: ${{ secrets.MOENV_API_KEY }}
           IN_FORCE: ${{ inputs.force }}
         run: |
           ARGS="--check --out site"
@@ -80,13 +89,68 @@ jobs:
         if: steps.quick.outputs.skip != 'true'
         run: pip install -r requirements.txt
 
-      - name: 產生資料與圖片
+      # v22.3：上一版網站（上一次 run 的 github-pages artifact，保留 1 天）→ prev/；失敗就當作沒有（自動改走 full）
+      - name: 取得上一版網站（Actions artifact，不吃 Pages 流量）
+        id: prev
         if: steps.quick.outputs.skip != 'true'
+        continue-on-error: true
+        timeout-minutes: 4
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ID=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=github-pages&per_page=30" \
+            --jq '[.artifacts[] | select(.expired == false)] | sort_by(.created_at) | last | .id // empty')
+          if [ -z "$ID" ]; then echo "ℹ️ 沒有上一版 artifact（會改走 full）"; echo "ok=false" >> "$GITHUB_OUTPUT"; exit 0; fi
+          curl -fsSL --retry 3 -H "Authorization: Bearer $GH_TOKEN" -o prev.zip \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/artifacts/$ID/zip"
+          mkdir -p prev prev_zip && unzip -q prev.zip -d prev_zip && tar -xf prev_zip/artifact.tar -C prev
+          rm -rf prev.zip prev_zip
+          test -s prev/manifest.json
+          du -sh prev
+          echo "ok=true" >> "$GITHUB_OUTPUT"
+
+      - name: 只更新 10 分鐘雨量：沿用上一版網站
+        if: steps.quick.outputs.mode == 'r10' && steps.prev.outputs.ok == 'true'
+        run: mkdir -p site && cp -a prev/. site/
+
+      - name: 產生資料與圖片
+        if: steps.quick.outputs.skip != 'true' && (steps.quick.outputs.mode != 'r10' || steps.prev.outputs.ok != 'true')
         env:
           PAGES_BASE: ${{ steps.pages.outputs.base_url }}/
           CWA_API_KEY: ${{ secrets.CWA_API_KEY }}
           MPLBACKEND: Agg
-        run: python scripts/tw_weather.py --out site
+        run: |
+          # v22.3：有上一版 artifact 就從它讀 48h 歷史（原本：python scripts/tw_weather.py --out site）
+          if [ -s prev/manifest.json ]; then python scripts/tw_weather.py --out site --prev-dir prev
+          else python scripts/tw_weather.py --out site; fi
+
+      # v22.2：環境部空氣品質（AQI＋各污染物，需要 secrets.MOENV_API_KEY；沒設定就自動略過）
+      # continue-on-error：這一步失敗也照樣發布天氣圖；程式會盡量沿用線上上一版的空品檔案
+      - name: 空氣品質資料與圖片（環境部；失敗不影響天氣）
+        if: steps.quick.outputs.skip != 'true' && (steps.quick.outputs.mode != 'r10' || steps.prev.outputs.ok != 'true')
+        continue-on-error: true
+        timeout-minutes: 8
+        env:
+          PAGES_BASE: ${{ steps.pages.outputs.base_url }}/
+          MOENV_API_KEY: ${{ secrets.MOENV_API_KEY }}
+          MPLBACKEND: Agg
+        run: |
+          if [ -s prev/air.json ]; then python scripts/tw_air.py --out site --prev-dir prev
+          else python scripts/tw_air.py --out site; fi
+
+      # v22.3：10 分鐘雨量（只抓 S3 O-A0002；失敗會沿用上一版 r10，不影響其他圖）
+      - name: 10 分鐘雨量（r10m 每 10 分鐘重畫）
+        if: steps.quick.outputs.skip != 'true'
+        continue-on-error: true
+        timeout-minutes: 5
+        env:
+          PAGES_BASE: ${{ steps.pages.outputs.base_url }}/
+          CWA_API_KEY: ${{ secrets.CWA_API_KEY }}
+          MPLBACKEND: Agg
+        run: |
+          trap 'rm -rf site/_raw' EXIT
+          if [ -d prev ]; then python scripts/tw_r10.py --out site --prev-dir prev; else python scripts/tw_r10.py --out site; fi
 
       - name: 網站大小
         if: steps.quick.outputs.skip != 'true'
