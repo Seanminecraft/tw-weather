@@ -156,6 +156,10 @@ jobs:
         if: steps.quick.outputs.skip != 'true'
         run: du -sh site site/img/history site/data || true
 
+      - name: 使用說明圖片（guide/ 放上網站）
+        if: steps.quick.outputs.skip != 'true'
+        run: if [ -d guide ]; then mkdir -p site/guide && cp -a guide/. site/guide/; fi
+
       - name: 打包網站
         if: steps.quick.outputs.skip != 'true'
         uses: actions/upload-pages-artifact@v5
