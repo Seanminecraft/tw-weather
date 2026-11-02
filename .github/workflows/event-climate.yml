@@ -47,6 +47,13 @@ jobs:
           sudo apt-get install -y -q poppler-utils > /dev/null
           pip install -q cdsapi netCDF4 numpy
           python scripts/event_outlook.py --out event_climate
+      - name: 更新氣候指數（ENSO／PDO／MJO／IOD）
+        # 每天抓 ONI、PDO、MJO 指數與 CPC／IRI 預報；示意圖只在 ERSST 有新月份時才重畫。失敗不影響其他步驟
+        continue-on-error: true
+        timeout-minutes: 15
+        run: |
+          pip install -q matplotlib netCDF4 numpy
+          python scripts/event_indices.py --out event_climate
       - name: 有變更才 commit
         run: |
           git config user.name "event-climate-bot"
