@@ -33,6 +33,8 @@ jobs:
           rm -f run.log
       - name: 颱風標記與警示燈號回推（中央氣象署颱風資料庫）
         run: python scripts/event_hazard.py --out event_climate
+      - name: 氣候診斷（與 1991–2020 氣候值比較）
+        run: python scripts/event_climo.py --out event_climate
       - name: 有變更才 commit
         run: |
           git config user.name "event-climate-bot"
