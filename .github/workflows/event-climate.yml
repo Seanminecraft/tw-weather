@@ -1,0 +1,32 @@
+# 🎪 場次氣候：每天檢查一次，場次結束滿 2 天就抓氣象署測站觀測，存到 event_climate/（commit 回 repo）
+# 場次清單即時讀取使用者的 Google 試算表（CSV 匯出），新場次會自動加入；不需要金鑰
+# 網站（GitHub Pages）由 tw-weather.yml 下次執行時把 event_climate/ 一起發布；jsDelivr 也能直接讀 repo
+name: event-climate
+on:
+  schedule:
+    - cron: '35 18 * * *'   # 每天台灣時間 02:35
+  workflow_dispatch:
+concurrency:
+  group: event-climate
+  cancel-in-progress: false
+permissions:
+  contents: write
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: 更新場次氣候資料
+        run: python scripts/event_climate.py --out event_climate
+      - name: 有變更才 commit
+        run: |
+          git config user.name "event-climate-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add event_climate
+          if git diff --cached --quiet; then echo "沒有新資料"; exit 0; fi
+          git commit -m "場次氣候資料更新 $(date -u +%F)"
+          git push
