@@ -55,7 +55,7 @@ def editions(today):
         if ed < sd or (ed - sd).days > 15: ed = sd
         if (today - ed).days < 2: continue
         eid = f"{s}_{sd.isoformat()}"
-        out[eid] = dict(id=eid, series=s, name=re.sub(r"[^\w\s\-()（）．.·:：&＆!！×☆★【】《》]", "", r["活動名稱"]).strip(),
+        out[eid] = dict(id=eid, key=f"{SERIES.index(s):02d}_{sd.isoformat()}", series=s, name=re.sub(r"[^\w\s\-()（）．.·:：&＆!！×☆★【】《》]", "", r["活動名稱"]).strip(),
                         start=sd.isoformat(), end=ed.isoformat(), venue=r["活動地點"].strip(), city=r["縣市"],
                         lat=float(r["緯度"]), lon=float(r["經度"]))
     return list(out.values())
@@ -138,7 +138,12 @@ def summarize(hrs, day, src):
     else: wx = "dry"
     tmax, tmin = max(T), min(T)
     m = day.month
-    return dict(date=day.isoformat(), src=src, tmax=round(tmax, 1), tmin=round(tmin, 1), tavg=avg("T"),
+    hr = {k: [None] * 24 for k in ("T", "AT", "P", "RH", "V", "D")}
+    for x in hrs:
+        i = x["h"]
+        for k in ("T", "P", "RH", "V", "D"): hr[k][i] = None if x[k] is None else round(x[k], 1)
+        if x["RH"] is not None: hr["AT"][i] = round(apparent(x["T"], x["RH"], x["V"] or 0), 1)
+    return dict(hr=hr, date=day.isoformat(), src=src, tmax=round(tmax, 1), tmin=round(tmin, 1), tavg=avg("T"),
                 at=round(sum(at) / len(at), 1) if at else None, at_max=round(max(at), 1) if at else None,
                 rh=avg("RH"), ws=avg("V"), wd=wd, rain=rain, rain_open=rain_open, wx=wx,
                 hi_max=round(max(hi), 1) if hi and 4 <= m <= 10 else None,
@@ -176,14 +181,15 @@ def main():
     ap.add_argument("--limit", type=int, default=0); a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True); path = os.path.join(a.out, "editions.json")
     old = {}
-    src = a.prev.rstrip("/") + "/editions.json" if a.prev else ""
-    try:
-        if src: old = {x["id"]: x for x in json.loads(get(src))["editions"]}
-    except Exception as ex: print("no previous data online:", ex)
-    if not old and os.path.exists(path): old = {x["id"]: x for x in json.load(open(path, encoding="utf-8"))["editions"]}
+    for i in range(len(SERIES)):  # 逐時資料存在 series_XX.json
+        f = os.path.join(a.out, f"series_{i:02d}.json")
+        try:
+            j = json.load(open(f, encoding="utf-8")) if os.path.exists(f) else (json.loads(get(a.prev.rstrip("/") + f"/series_{i:02d}.json")) if a.prev else None)
+            if j: old.update({x["id"]: x for x in j["editions"]})
+        except Exception as ex: print("no previous", f, ex)
     today = dt.datetime.now(TZ).date()
     eds = editions(today)
-    todo = [e for e in eds if e["id"] not in old]
+    todo = [e for e in eds if e["id"] not in old or not all("hr" in d for d in old[e["id"]]["days"])]
     if a.limit: todo = todo[:a.limit]
     print(f"editions {len(eds)}, stored {len(old)}, to fetch {len(todo)}")
     with ThreadPoolExecutor(3) as ex:
@@ -194,7 +200,8 @@ def main():
     meta = dict(updated=dt.datetime.now(TZ).isoformat(timespec="minutes"), series=SERIES,
                 stations=[dict(id=s[0].split("|")[0], name=s[1], lat=s[2], lon=s[3]) for s in STATIONS],
                 attribution="中央氣象署測站觀測（CODiS）；部分早期資料為 ERA5 再分析（Copernicus/ECMWF，經 Open-Meteo）")
-    json.dump(dict(meta=meta, editions=res), open(path, "w", encoding="utf-8"), ensure_ascii=False, separators=(",", ":"))
+    lite = [dict(x, key=x.get("key") or next(e["key"] for e in eds if e["id"] == x["id"]), days=[{k: v for k, v in d.items() if k != "hr"} for d in x["days"]]) for x in res]
+    json.dump(dict(meta=meta, editions=lite), open(path, "w", encoding="utf-8"), ensure_ascii=False, separators=(",", ":"))
     for s in SERIES:
         json.dump(dict(meta=meta, editions=[x for x in res if x["series"] == s]),
                   open(os.path.join(a.out, f"series_{SERIES.index(s):02d}.json"), "w", encoding="utf-8"), ensure_ascii=False, separators=(",", ":"))
