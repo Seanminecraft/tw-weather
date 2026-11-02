@@ -32,10 +32,11 @@ def classify(r):
     K, C, T = "高雄" in city, "臺中" in city, city in ("臺北市", "新北市", "桃園市")
     if "駁二動漫祭" in n: return "FF高雄"
     if "開拓" in org and K and not re.search(r"Only", n, re.I): return "FF高雄"
-    if re.search(r"Only|RF\d|Reality Fantasy|Party", n, re.I) and not re.search(r"CWT|Comic World", n): return None
+    PFm = re.search(r"Petit\s*Fancy|\bPF\s*\d", n, re.I)   # PF 與 RF 合辦（如 PF45+RF14）仍算 PF
+    if re.search(r"Only|RF\d|Reality Fantasy|Party", n, re.I) and not re.search(r"CWT|Comic World", n, re.I) and not (PFm and not re.search(r"Only", n, re.I)): return None
     if re.search(r"開拓動漫祭|Fancy Frontier|\bFF\d", n): return "FF高雄" if K else ("FF台北" if T else None)
-    if re.search(r"Petit Fancy|\bPF\d", n): return "PF"
-    if re.search(r"Comic World|CWT", n): return "CWT高雄" if K else "CWT台中" if C else "CWT台北" if T else None
+    if PFm: return "PF" if T else None
+    if re.search(r"Comic World|CWT", n, re.I): return "CWT高雄" if K else "CWT台中" if C else "CWT台北" if T else None
     if "漫畫博覽會" in n: return "台北漫畫博覽會" if T and not re.search(r"高雄|臺中|台中|臺南|台南", n) else None
     if re.search(r"[台臺]北國際動漫節|TiCA", n): return "台北國際動漫節"
     if re.search(r"[台臺]中國際動漫節", n): return "台中國際動漫節"
