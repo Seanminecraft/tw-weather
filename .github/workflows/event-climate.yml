@@ -1,5 +1,5 @@
 # 🎪 場次氣候：每天檢查一次，場次結束滿 2 天就抓氣象署測站觀測，存到 event_climate/（commit 回 repo）
-# 場次清單即時讀取使用者的 Google 試算表（CSV 匯出），新場次會自動加入；不需要金鑰
+# 場次清單即時讀取使用者的 Google 試算表（CSV 匯出），新場次會自動加入；近期展望的 C3S 部分使用 GitHub Secrets 的 CDS_API_KEY
 # 網站（GitHub Pages）由 tw-weather.yml 下次執行時把 event_climate/ 一起發布；jsDelivr 也能直接讀 repo
 name: event-climate
 on:
@@ -35,6 +35,18 @@ jobs:
         run: python scripts/event_hazard.py --out event_climate
       - name: 氣候診斷（與 1991–2020 氣候值比較）
         run: python scripts/event_climo.py --out event_climate
+      - name: 近期場次氣候展望（氣象署長期展望＋Copernicus C3S 季節預報）
+        # 氣象署月展望每週五、季展望每月底更新：每天抓一次最新 PDF（檔案很小）
+        # C3S 每月 10 日後才有新的初始場：只有新初始場時才下載；回報期門檻存在 outlook_src/，不會重抓
+        # 金鑰放在 GitHub Secrets 的 CDS_API_KEY，不會寫進任何檔案；沒設定時只更新氣象署部分
+        continue-on-error: true
+        timeout-minutes: 45
+        env:
+          CDS_API_KEY: ${{ secrets.CDS_API_KEY }}
+        run: |
+          sudo apt-get install -y -q poppler-utils > /dev/null
+          pip install -q cdsapi netCDF4 numpy
+          python scripts/event_outlook.py --out event_climate
       - name: 有變更才 commit
         run: |
           git config user.name "event-climate-bot"
