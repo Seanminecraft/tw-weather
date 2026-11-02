@@ -36,11 +36,11 @@ def classify(r):
     if re.search(r"開拓動漫祭|Fancy Frontier|\bFF\d", n): return "FF高雄" if K else ("FF台北" if T else None)
     if re.search(r"Petit Fancy|\bPF\d", n): return "PF"
     if re.search(r"Comic World|CWT", n): return "CWT高雄" if K else "CWT台中" if C else "CWT台北" if T else None
-    if "漫畫博覽會" in n: return "台北漫畫博覽會"
+    if "漫畫博覽會" in n: return "台北漫畫博覽會" if T and not re.search(r"高雄|臺中|台中|臺南|台南", n) else None
     if re.search(r"[台臺]北國際動漫節|TiCA", n): return "台北國際動漫節"
     if re.search(r"[台臺]中國際動漫節", n): return "台中國際動漫節"
     if "高雄國際動漫節" in n: return "高雄國際動漫節"
-    if re.search(r"^\W*GJ|GJ\d", n): return "GJ"
+    if re.search(r"^\W*GJ|GJ\d", n): return "GJ" if C else None   # GJ 主場在臺中，排除臺南場等外地場
     if "創集繪" in n: return "IF創集繪"
     return None
 
@@ -78,16 +78,28 @@ def codis(stn, day):
     j = json.loads(get("https://codis.cwa.gov.tw/api/station", body))
     if not j.get("data"): return None
     hrs = []
-    def v(x, k="Instantaneous"):
+    def v(x, k="Instantaneous", rain=False, neg=False):
+        # 氣象署特殊值：-9.8／T＝雨跡（雨量算 0）；-9.5～-9.9、-99.x 等＝儀器故障／缺測 → 當作缺值（不是 0）
         if not isinstance(x, dict): return None
         y = x.get(k)
-        if y is None: y = next((x[q] for q in x if not q.endswith("f") and isinstance(x[q], (int, float))), None)
-        return None if y is None or y < -90 else y
+        if y is None: y = next((x[q] for q in x if not q.endswith("f") and isinstance(x[q], (int, float, str))), None)
+        if isinstance(y, str):
+            if rain and y.strip().upper() == "T": return 0.0
+            try: y = float(y)
+            except ValueError: return None
+        if y is None: return None
+        if rain and abs(y + 9.8) < 1e-6: return 0.0
+        if y <= -9.5 and (y < -90 or -9.95 <= y <= -9.45): return None   # 溫度合法負值以外的代碼
+        if not neg and y < 0: return None   # 只有氣溫可為負
+        return y
     for h in j["data"][0]["dts"]:
-        hrs.append(dict(h=int(h["DataTime"][11:13]) % 24, T=v(h.get("AirTemperature")), RH=v(h.get("RelativeHumidity")),
+        hrs.append(dict(h=int(h["DataTime"][11:13]) % 24, T=v(h.get("AirTemperature"), neg=True), RH=v(h.get("RelativeHumidity")),
                         V=v(h.get("WindSpeed"), "Mean"), D=v(h.get("WindDirection"), "Prevailing") or v(h.get("WindDirection"), "Mean"),
-                        P=v(h.get("Precipitation"), "Accumulation"), S=v(h.get("SunshineDuration"), "Total"),
+                        P=v(h.get("Precipitation"), "Accumulation", True), S=v(h.get("SunshineDuration"), "Total"),
                         C=v(h.get("TotalCloudAmount"), "Instantaneous")))
+    for x in hrs:
+        if x["D"] is not None and x["D"] > 360: x["D"] = None   # 990＝風向不定
+        if x["RH"] is not None and x["RH"] > 100: x["RH"] = None
     hrs = [x for x in hrs if x["T"] is not None]
     return hrs if len(hrs) >= 12 else None
 
@@ -105,9 +117,12 @@ def era5(lat, lon, d0, d1):
 
 def summarize(hrs, day, src):
     T = [x["T"] for x in hrs]; open_ = [x for x in hrs if 10 <= x["h"] <= 17] or hrs
+    def ok(k, L): return sum(1 for x in L if x[k] is not None) * 2 >= len(L)   # 一半以上時數缺測 → null
     def avg(k, L=open_):
+        if not ok(k, L): return None
         a = [x[k] for x in L if x[k] is not None]; return round(sum(a) / len(a), 1) if a else None
-    rain = round(sum(x["P"] or 0 for x in hrs), 1); rain_open = round(sum(x["P"] or 0 for x in open_), 1)
+    def rsum(L): return round(sum(x["P"] for x in L if x["P"] is not None), 1) if ok("P", L) else None
+    rain = rsum(hrs); rain_open = rsum(open_)
     at = [apparent(x["T"], x["RH"], x["V"] or 0) for x in open_ if x["RH"] is not None]
     hi = [heat_index(x["T"], x["RH"], x["V"] or 0) for x in open_ if x["RH"] is not None]
     # 盛行風向（向量平均）
@@ -115,9 +130,9 @@ def summarize(hrs, day, src):
     w = [-(x["V"] or 0) * math.cos(math.radians(x["D"])) for x in open_ if x["D"] is not None]
     wd = round((math.degrees(math.atan2(-sum(u), -sum(w))) + 360) % 360) if u and (sum(u) or sum(w)) else None
     cl = avg("C"); sun = sum(x["S"] or 0 for x in open_) if any(x["S"] is not None for x in open_) else None
-    if rain_open >= 10: wx = "rain_heavy"
-    elif rain_open >= 0.5: wx = "rain"
-    elif rain > 0.5: wx = "shower_offhours"
+    if rain_open is not None and rain_open >= 10: wx = "rain_heavy"
+    elif rain_open is not None and rain_open >= 0.5: wx = "rain"
+    elif rain is not None and rain > 0.5: wx = "shower_offhours"
     elif cl is not None: wx = "sunny" if cl <= 3 else "cloudy" if cl <= 7 else "overcast"
     elif sun is not None: wx = "sunny" if sun >= 5 else "cloudy" if sun >= 2 else "overcast"
     else: wx = "dry"
