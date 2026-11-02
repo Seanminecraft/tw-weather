@@ -31,6 +31,8 @@ jobs:
             grep -q "synoptic to do 0" run.log && break
           done
           rm -f run.log
+      - name: 颱風標記與警示燈號回推（中央氣象署颱風資料庫）
+        run: python scripts/event_hazard.py --out event_climate
       - name: 有變更才 commit
         run: |
           git config user.name "event-climate-bot"
