@@ -152,13 +152,14 @@ jobs:
           trap 'rm -rf site/_raw' EXIT
           if [ -d prev ]; then python scripts/tw_r10.py --out site --prev-dir prev; else python scripts/tw_r10.py --out site; fi
 
+      # 場次氣候：把 repo 的 event_climate/ 一起放進網站（event-climate.yml 每天更新）
+      - name: 場次氣候資料
+        if: steps.quick.outputs.skip != 'true'
+        run: if [ -d event_climate ]; then rm -rf site/event_climate && cp -a event_climate site/; fi
+
       - name: 網站大小
         if: steps.quick.outputs.skip != 'true'
         run: du -sh site site/img/history site/data || true
-
-      - name: 使用說明圖片（guide/ 放上網站）
-        if: steps.quick.outputs.skip != 'true'
-        run: if [ -d guide ]; then mkdir -p site/guide && cp -a guide/. site/guide/; fi
 
       - name: 打包網站
         if: steps.quick.outputs.skip != 'true'
