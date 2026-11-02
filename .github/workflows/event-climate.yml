@@ -14,7 +14,7 @@ permissions:
 jobs:
   update:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -22,6 +22,15 @@ jobs:
           python-version: '3.12'
       - name: 更新場次氣候資料
         run: python scripts/event_climate.py --out event_climate
+      - name: 綜觀天氣圖（ERA5 再分析；只畫新的場次日）
+        run: |
+          pip install -q xarray zarr gcsfs matplotlib cartopy pillow
+          # 偶爾連線卡住：每輪最多 8 分鐘，已完成的會保留，下一輪接著畫
+          for i in 1 2 3 4 5 6; do
+            timeout 480 python scripts/event_synoptic.py --out event_climate --workers 4 | tee run.log || true
+            grep -q "synoptic to do 0" run.log && break
+          done
+          rm -f run.log
       - name: 有變更才 commit
         run: |
           git config user.name "event-climate-bot"
