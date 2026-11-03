@@ -7,6 +7,7 @@
 # 48 小時歷史：存在 GitHub Pages 網站裡（每次先下載上一版再加上新的一小時），不會 commit，repo 不會變大
 # 輸出：https://<帳號>.github.io/tw-weather/manifest.json、img/latest/<變數>_<station|town>.png（固定網址）
 # v22.2 空品：air.json、img/latest/aq_<項目>_<station|town>.png、img/history_aq/（48h）；secrets.MOENV_API_KEY
+# v22.4 場館降雨地圖：img/rain/<場館>.png＋img/rain/manifest.json（每次 r10／full 都重畫）
 # v22.3 10 分鐘雨量：cron 每 10 分鐘（:07 :17 … :57；S3 約晚 6 分鐘上檔）。每次自己判斷要做什麼：
 #   full ＝ 新的整點（或空品還沒更新）→ 全部重做（和以前一樣）＋ r10
 #   r10  ＝ 整點已是最新、只有 10 分鐘雨量是新的 → 沿用上一版網站（Actions artifact）只重畫 r10m 兩張圖＋資料
@@ -156,6 +157,18 @@ jobs:
       - name: 場次氣候資料
         if: steps.quick.outputs.skip != 'true'
         run: if [ -d event_climate ]; then rm -rf site/event_climate && cp -a event_climate site/; fi
+
+      # v22.4：場館降雨地圖（雷達回波＋1 小時定量降雨，全部場館；Apps Script 推播雨／雷雨燈號時附圖）
+      # continue-on-error＋timeout：這步失敗也照樣發布網站（r10 模式會留著上一版圖，manifest 時間舊了 Apps Script 就不附圖）
+      - name: 場館降雨地圖（每 10 分鐘；失敗不影響其他圖）
+        if: steps.quick.outputs.skip != 'true'
+        continue-on-error: true
+        timeout-minutes: 5
+        env:
+          PAGES_BASE: ${{ steps.pages.outputs.base_url }}/
+          CWA_API_KEY: ${{ secrets.CWA_API_KEY }}
+          MPLBACKEND: Agg
+        run: python scripts/tw_rainmap.py --out site
 
       - name: 網站大小
         if: steps.quick.outputs.skip != 'true'
