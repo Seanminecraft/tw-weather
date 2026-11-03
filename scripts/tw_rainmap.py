@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import tw_render as R
 
 # 場館清單（照 code.gs VENUE_META 的名稱與 WGS84 座標；新增場館時兩邊一起加）
-# key: (名稱, 緯度, 經度, "縣市|行政區", 雨量站代碼清單)
+# key: (名稱, 緯度, 經度, "縣市|行政區", 舊有人站清單＝只參考，v22.5 雨量圖改用 O-A0002 最近站)
 VENUES = {
     "huabo": ("花博爭豔館", 25.06980, 121.52110, "臺北市|中山區", ['466920', 'C0AH70']),
     "underground": ("台北地下街", 25.04930, 121.51210, "臺北市|中正區", ['466920']),
@@ -63,10 +63,10 @@ VENUES = {
     "ntsus": ("國立臺灣體育運動大學體育館", 24.14920, 120.68790, "臺中市|北區", ['467490']),
     "breeze": ("微風廣場", 25.04580, 121.54500, "臺北市|松山區", ['C0AH70']),
     "taipei_moc": ("臺北文創", 25.04450, 121.56130, "臺北市|松山區", ['C0AH70']),
-    "taichung_cityhall": ("臺中市政府惠中樓", 24.16224, 120.64587, "臺中市|西屯區", ['C0F9T0']),
-    "taichung_icec": ("臺中國際會展中心", 24.19331, 120.65045, "臺中市|西屯區", ['C0F9T0']),
+    "taichung_cityhall": ("臺中市政府惠中樓", 24.16223863373963, 120.64586771363027, "臺中市|西屯區", ['C0F9T0']),
+    "taichung_icec": ("臺中國際會展中心", 24.19330567094997, 120.65044788404585, "臺中市|西屯區", ['C0F9T0']),
     "nuli_space": ("女力空間", 25.04222, 121.56542, "臺北市|信義區", ['C0AC70']),
-    "kh_exhibition": ("高雄展覽館", 22.60789, 120.29847, "高雄市|前鎮區", ['C0V890']),
+    "kh_exhibition": ("高雄展覽館", 22.60789376549128, 120.29847137572354, "高雄市|前鎮區", ['C0V890']),
 }
 
 # 淹水警戒門檻（照 code.gs FLOOD_THRESHOLDS；mm）
@@ -192,11 +192,71 @@ def build_fig(towns, lines, G1, G2):
 
 
 # ------------------------------------------------------------------ 雨量站逐時圖（大雨特報／淹水燈號附圖）
-# 資料：tw-weather 自己的 48h 歷史 site/data/history/store.json.gz（每小時 O-A0001/O-A0002 影格；不另打 API）
+# v22.5：測站＝儀表板「累積雨量」工作表同一站（code.gs syncRainfallToSheet）：
+#   O-A0002-001 自動雨量站全部測站，取 WGS84 座標（沒有就用第一組），與 VENUE_META 座標算大圓距離（R=6371 km），最近的那一站
+#   （不再用上面 VENUES 第 5 欄的有人站清單；那欄只留著參考）
+# 逐時資料：tw-weather 自己的 48h 歷史 site/data/history/store.json.gz（每小時影格，r1h/r24h 來自 O-A0002；不另打 API）
+# 最新數值：本輪下載的 O-A0002-001（與儀表板同一份 10 分鐘資料）
 TPE = dt.timezone(dt.timedelta(hours=8))
 # 儀表板「☔ 氣象署降雨特報／雨量燈號」RAIN_YELLOW／RAIN_HEAVY／RAIN_TORRENTIAL／RAIN_EXTREME 門檻（mm）：(名稱, 1h, 3h, 24h)
 CWA_RAIN = [("大雨", 40, None, 80), ("豪雨", None, 100, 200), ("大豪雨", None, 200, 350), ("超大豪雨", None, None, 500)]
 LVL_COL = {"大雨": "#f1c40f", "豪雨": "#e67e22", "大豪雨": "#e74c3c", "超大豪雨": "#8e44ad"}
+
+
+SRC["rain"] = ("Observation/O-A0002-001.json", "O-A0002-001")
+
+
+def _haversine_km(lat1, lon1, lat2, lon2):
+    """與 code.gs haversineKm_ 相同公式"""
+    r = math.pi / 180
+    dla, dlo = (lat2 - lat1) * r, (lon2 - lon1) * r
+    a = math.sin(dla / 2) ** 2 + math.cos(lat1 * r) * math.cos(lat2 * r) * math.sin(dlo / 2) ** 2
+    return 2 * 6371 * math.asin(min(1.0, math.sqrt(a)))
+
+
+def _num(v):
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return None if f <= -90 else f
+
+
+def rain_stations(doc):
+    """O-A0002-001 → [{id,name,lat,lng,t,h1,h3,h24,now}]；座標規則同 code.gs rainStationLatLng_"""
+    ds = (doc.get("cwaopendata") or {}).get("dataset") or (doc.get("records") or {})
+    out = []
+    for s in ds.get("Station") or []:
+        g = s.get("GeoInfo") or {}
+        co = g.get("Coordinates") or []
+        if isinstance(co, dict):
+            co = [co]
+        lat = lng = None
+        for c in co:
+            la = _num(c.get("StationLatitude", c.get("Latitude")))
+            lo = _num(c.get("StationLongitude", c.get("Longitude")))
+            if la is None or lo is None:
+                continue
+            if "WGS84" in str(c.get("CoordinateName") or "") or lat is None:
+                lat, lng = la, lo
+        if lat is None:
+            continue
+        re_ = s.get("RainfallElement") or {}
+        pv = lambda k: _num((re_.get(k) or {}).get("Precipitation"))
+        out.append({"id": str(s.get("StationId") or ""), "name": s.get("StationName") or "", "lat": lat, "lng": lng,
+                    "t": (s.get("ObsTime") or {}).get("DateTime") or "",
+                    "h1": pv("Past1hr"), "h3": pv("Past3hr"), "h24": pv("Past24hr"), "now": pv("Now")})
+    return out
+
+
+def nearest_rain_station(stations, lat, lng):
+    """同 code.gs：逐站比較，距離「嚴格小於」才換（同距離取先出現的）"""
+    best, bd = None, 1e9
+    for st in stations:
+        d = _haversine_km(lat, lng, st["lat"], st["lng"])
+        if d < bd:
+            best, bd = st, d
+    return best, (round(bd, 3) if best else None)
 
 
 def load_store(out, pages_base):
@@ -248,7 +308,7 @@ def level_of(h1, h3, h24):
     return lv
 
 
-def render_gauge(path, title, sid, sname, ts, r1, r24, flood=None):
+def render_gauge(path, title, sid, sname, ts, r1, r24, flood=None, dkm=None):
     import matplotlib.dates as mdates
     r3, rday = gauge_stats(ts, r1, r24)
     fig, ax = plt.subplots(figsize=(12, 6.2), dpi=100)
@@ -309,10 +369,10 @@ def render_gauge(path, title, sid, sname, ts, r1, r24, flood=None):
     h1, l1 = ax.get_legend_handles_labels(); h2, l2 = ax2.get_legend_handles_labels()
     ax.legend(h1 + h2, l1 + l2, loc="upper left", fontsize=9, framealpha=.9)
     last = len(ts) - 1
-    ax.set_title("%s｜%s（%s）逐時雨量\n最新 %s：1h %s、3h %s、24h %s、今日 %s mm" % (
-        title, sname, sid, ts[last].strftime("%m/%d %H:%M"), fmt(r1[last]), fmt(r3[last]), fmt(r24[last]), fmt(rday[last])),
+    ax.set_title("%s｜%s（%s%s）逐時雨量\n整點 %s：1h %s、3h %s、24h %s、今日 %s mm" % (
+        title, sname, sid, ("，距場館 %.1f km" % dkm) if dkm is not None else "", ts[last].strftime("%m/%d %H:%M"), fmt(r1[last]), fmt(r3[last]), fmt(r24[last]), fmt(rday[last])),
         fontsize=14, fontweight="bold")
-    fig.text(.5, .01, "資料：中央氣象署 自動氣象站／自動雨量站（O-A0001-001、O-A0002-001）逐時｜長條顏色＝達該級（大雨黃、豪雨橘、大豪雨紅、超大豪雨紫）｜同人場次天氣儀表板",
+    fig.text(.5, .01, "資料：中央氣象署 自動雨量站 O-A0002-001（場館最近站＝儀表板「累積雨量」同站）逐時｜長條顏色＝達該級（大雨黃、豪雨橘、大豪雨紅、超大豪雨紫）｜同人場次天氣儀表板",
              ha="center", fontsize=8.5, color="#555555")
     fig.tight_layout(rect=[0, .03, 1, 1])
     fig.savefig(path); plt.close(fig)
@@ -324,37 +384,54 @@ def fmt(v):
     return "—" if v is None or v < 0 else ("%g" % v)
 
 
-def render_gauges(out, man, keys, pages_base, demo=None):
+def render_gauges(out, man, keys, pages_base, demo=None, rain_file=None):
     st = load_store(out, pages_base)
     if not st.get("frames"):
         raise RuntimeError("沒有 48h 歷史")
+    doc = json.load(open(rain_file, encoding="utf-8")) if rain_file else fetch("rain")
+    stations = rain_stations(doc)
+    if len(stations) < 100:
+        raise RuntimeError("O-A0002-001 測站太少（%d），不畫雨量圖以免選錯站" % len(stations))
     odir = os.path.join(out, "img", "rain")
     done = {}
     jobs = []
     for k in keys:
-        name, lat, lng, cd, sids = VENUES[k]
-        sid = next((s for s in sids if s in st.get("meta", {})), None)
-        if sid:
-            jobs.append((k, name, sid, FLOOD_THRESHOLDS.get(cd)))
+        name, lat, lng, cd = VENUES[k][:4]
+        rs, dkm = nearest_rain_station(stations, lat, lng)
+        if rs:
+            jobs.append((k, name, rs, dkm, FLOOD_THRESHOLDS.get(cd)))
     if demo:
-        jobs.append(("demo_" + demo, "示意", demo, None))
-    for k, name, sid, flood in jobs:
+        rs = next((x for x in stations if x["id"] == demo), None)
+        if rs:
+            jobs.append(("demo_" + demo, "示意", rs, None, None))
+    for k, name, rs, dkm, flood in jobs:
+        sid = rs["id"]
         try:
+            if sid not in st.get("meta", {}):
+                raise RuntimeError("48h 歷史沒有 %s（新站？下一輪就有）" % sid)
             ts, r1, r24 = station_series(st, sid)
-            info = render_gauge(os.path.join(odir, k + "_gauge.png"), name, sid, st["meta"][sid][0], ts, r1, r24, flood)
-            info.update({"png": "img/rain/%s_gauge.png" % k, "sid": sid, "sname": st["meta"][sid][0]})
+            info = render_gauge(os.path.join(odir, k + "_gauge.png"), name, sid, rs["name"], ts, r1, r24, flood, dkm)
+            info.update({"png": "img/rain/%s_gauge.png" % k, "sid": sid, "sname": rs["name"], "dist_km": dkm,
+                         "src": "O-A0002-001"})
+            # 最新 10 分鐘數值＝儀表板「累積雨量」同一份資料（逐時長條仍是整點影格）
+            if rs["t"]:
+                info.update({"t": rs["t"][:16] + rs["t"][19:] if len(rs["t"]) >= 25 else rs["t"],
+                             "r1h": rs["h1"], "r3h": rs["h3"], "r24h": rs["h24"], "rday": rs["now"],
+                             "level": level_of(rs["h1"], rs["h3"], rs["h24"])})
             man["venues"].setdefault(k, {"name": name})["gauge"] = info
             done[k] = 1
         except Exception as e:
+            man["venues"].setdefault(k, {"name": name})["gauge_station"] = {"sid": sid, "sname": rs["name"], "dist_km": dkm}
             print("⚠️ 雨量圖 %s 失敗：%s" % (k, e))
     man["gauge_time"] = st["frames"][-1]["t"]
-    print("雨量站逐時圖 %d 張" % len(done))
+    man["gauge_station_rule"] = "O-A0002-001 最近站（同儀表板「累積雨量」）"
+    print("雨量站逐時圖 %d 張（%d 站可選）" % (len(done), len(stations)))
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="site")
-    ap.add_argument("--radar-file"); ap.add_argument("--qpf-file")   # 本機測試用
+    ap.add_argument("--radar-file"); ap.add_argument("--qpf-file"); ap.add_argument("--rain-file")   # 本機測試用
     ap.add_argument("--only", help="只畫這些場館（逗號分隔，測試用）")
     ap.add_argument("--gauge-demo", help="另外畫一張指定雨量站的逐時圖（測試用）")
     a = ap.parse_args()
@@ -384,7 +461,7 @@ def main():
         except Exception as e:
             print("⚠️ %s 失敗：%s" % (k, e))
     try:
-        render_gauges(a.out, man, keys, os.environ.get("PAGES_BASE", "").strip(), a.gauge_demo)
+        render_gauges(a.out, man, keys, os.environ.get("PAGES_BASE", "").strip(), a.gauge_demo, a.rain_file)
     except Exception as e:
         print("⚠️ 雨量站逐時圖略過：%s" % e)
     with open(os.path.join(odir, "manifest.json"), "w", encoding="utf-8") as f:
