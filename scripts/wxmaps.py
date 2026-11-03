@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# wxmaps v4
 """天氣圖：抓 ECMWF Open Data 與 NOAA GFS（免金鑰），畫 7 日預報天氣圖，輸出到 --out（含 manifest.json）。"""
 import os, sys, json, time, glob, argparse, datetime as dt
 import numpy as np, requests, eccodes
@@ -247,7 +248,7 @@ def _plot(job):
 def main():
     ap = argparse.ArgumentParser(); ap.add_argument("--out", default="wxmaps"); ap.add_argument("--workers", type=int, default=os.cpu_count())
     ap.add_argument("--cache", default="wx_cache"); a = ap.parse_args()
-    print("wxmaps v3", flush=True)
+    print("wxmaps v4", flush=True)
     import cartopy
     cartopy.config["data_dir"] = os.path.abspath(os.environ.get("WXMAPS_SHAPES", "ne_data"))
     os.makedirs(cartopy.config["data_dir"], exist_ok=True)
