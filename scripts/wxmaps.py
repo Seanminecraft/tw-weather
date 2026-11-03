@@ -42,17 +42,21 @@ def runs_back(n=12):
     return zero[:2] + [r for r in out if r not in zero[:2]]  # 先試最新兩個 00Z，再退回其他場次
 
 def pick_ecmwf():
+    out = []
     for r in runs_back():
         if r.hour in (6, 18): continue   # 06/18Z 只到 +90h
         u = f"https://data.ecmwf.int/forecasts/{r:%Y%m%d}/{r:%H}z/ifs/0p25/oper/{r:%Y%m%d%H}0000-168h-oper-fc.index"
-        if ok(u): return r
-    raise SystemExit("ECMWF: no complete run found")
+        if ok(u): out.append(r)
+        if len(out) >= 2: break
+    return out
 
 def pick_gfs():
+    out = []
     for r in runs_back():
         u = f"https://nomads.ncep.noaa.gov/pub/data/nccf/com/gfs/prod/gfs.{r:%Y%m%d}/{r:%H}/atmos/gfs.t{r:%H}z.pgrb2.0p25.f168.idx"
-        if ok(u): return r
-    raise SystemExit("GFS: no complete run found")
+        if ok(u): out.append(r)
+        if len(out) >= 2: break
+    return out
 
 def fetch_ecmwf(r, D):
     from ecmwf.opendata import Client
@@ -65,8 +69,23 @@ def fetch_ecmwf(r, D):
             ("p200", dict(param=["u", "v"], levelist=[200]))]
     files = []
     for name, q in reqs:
-        fn = f"{D}/ec_{name}.grib2"; c.retrieve(target=fn, **kw, **q); files.append(fn)
+        fn = f"{D}/ec_{name}.grib2"
+        for k in range(3):
+            try:
+                if os.path.exists(fn): os.remove(fn)
+                c.retrieve(target=fn, **kw, **q); validate_partial(fn); break
+            except Exception as e:
+                print("ECMWF retry", name, k + 1, e); time.sleep(15 * (k + 1))
+        else: raise RuntimeError(f"ECMWF {name} download failed")
+        files.append(fn)
     return files
+
+def validate_partial(fn):
+    n = 0
+    with open(fn, "rb") as f:
+        while (h := eccodes.codes_grib_new_from_file(f)) is not None:
+            eccodes.codes_get_values(h); eccodes.codes_release(h); n += 1
+    if n == 0: raise ValueError("no GRIB messages")
 
 def fetch_gfs(r, D):
     files = []
@@ -79,13 +98,34 @@ def fetch_gfs(r, D):
         for k in range(5):
             try:
                 x = requests.get(url, timeout=180)
-                if x.ok and x.content[:4] == b"GRIB": break
+                if x.ok and x.content[:4] == b"GRIB" and x.content[-4:] == b"7777":
+                    fn = f"{D}/gfs_f{s:03d}.grib2"; open(fn, "wb").write(x.content); validate_partial(fn); break
             except Exception: pass
             time.sleep(10 * (k + 1))
         else:
-            print("GFS step failed", s); continue
-        fn = f"{D}/gfs_f{s:03d}.grib2"; open(fn, "wb").write(x.content); files.append(fn); time.sleep(1)
+            raise RuntimeError(f"GFS f{s:03d} download failed")
+        files.append(fn); time.sleep(1)
     return files
+
+NEED = {"ecmwf": [("msl",0),("2t",0),("tp",0),("t",850),("u",850),("v",850),("r",700),("gh",500),("vo",500),("u",200),("v",200)],
+        "gfs": [("prmsl",0),("2t",0),("t",850),("u",850),("v",850),("r",700),("gh",500),("absv",500),("u",200),("v",200)]}
+
+def validate(model, files):
+    """在主程式逐筆解碼檢查：缺任何 (變數, 層, 時效) 或檔案損毀都算失敗。"""
+    have = set()
+    for fn in files:
+        for ix in glob.glob(fn + "*.idx"): os.remove(ix)
+        with open(fn, "rb") as f:
+            while (h := eccodes.codes_grib_new_from_file(f)) is not None:
+                sn = eccodes.codes_get(h, "shortName"); st = eccodes.codes_get(h, "endStep")
+                lv = 0 if sn in ("msl", "prmsl", "2t", "tp") else eccodes.codes_get(h, "level")
+                v = eccodes.codes_get_values(h)
+                if not np.isfinite(v).any(): raise ValueError(f"{fn}: empty field {sn}")
+                have.add((sn, lv, st)); eccodes.codes_release(h)
+    miss = [(sn, lv, s) for (sn, lv) in NEED[model] for s in STEPS
+            if (sn, lv, s) not in have and not (model == "gfs" and sn == "tp")]
+    if model == "gfs": miss += [("tp", 0, s) for s in STEPS if s and ("tp", 0, s) not in have]
+    if miss: raise ValueError(f"missing {len(miss)} fields, e.g. {miss[:3]}")
 
 def read(files, want):
     out = {}; meta = {}
@@ -120,6 +160,21 @@ def load(model, files):
 
 G = {}
 def plot(job):
+    try: return _plot(job)
+    except Exception as e:
+        plt.close("all"); print("map failed", job[:4], type(e).__name__, e, flush=True); return None
+
+def prefetch_shapes():
+    """先在主程式下載海岸線／國界（避免多個子程序同時下載、讀到一半的檔案）。"""
+    for res in ("10m", "50m", "110m"):
+        for f in (cf.COASTLINE.with_scale(res), cf.BORDERS.with_scale(res)):
+            for _ in range(3):
+                try: list(f.geometries()); break
+                except Exception as e:
+                    print("shape retry", res, e)
+                    import shutil, cartopy; shutil.rmtree(os.path.join(cartopy.config["data_dir"], "shapefiles"), ignore_errors=True)
+
+def _plot(job):
     model, dk, lk, s, out = job
     d, m, init = G[model]
     lat, lon = m["lat"], m["lon"]; LO, LA = np.meshgrid(lon, lat); name, ext = DOM[dk]
@@ -184,7 +239,14 @@ def main():
     for model, pick, fetch in (("ecmwf", pick_ecmwf, fetch_ecmwf), ("gfs", pick_gfs, fetch_gfs)):
         t = time.time()
         try:
-            r = pick(); files = fetch(r, a.cache)
+            files = None
+            for r in pick():
+                try:
+                    for f in glob.glob(f"{a.cache}/{'ec' if model == 'ecmwf' else 'gfs'}_*"): os.remove(f)
+                    files = fetch(r, a.cache); validate(model, files); break
+                except Exception as e:
+                    print(f"{model} run {r:%Y-%m-%d %HZ} not usable ({e}); trying previous run"); files = None
+            if not files: raise RuntimeError("no complete run")
             nbytes = sum(os.path.getsize(f) for f in files)
             d, m = load(model, files); G[model] = (d, m, r)
             have = sorted({k[2] for k in d})
@@ -194,9 +256,10 @@ def main():
         except Exception as e: print(model, "failed:", e)
     jobs = [(mo, dk, lk, s, a.out) for mo in man["models"] for dk in DOM for lk in LAY for s in man["models"][mo]["steps"]]
     t = time.time()
-    with Pool(a.workers) as p: p.map(plot, jobs, chunksize=4)
-    print(f"plotted {len(jobs)} maps in {time.time()-t:.0f}s")
+    prefetch_shapes()
+    with Pool(a.workers, maxtasksperchild=40) as p: res = p.map(plot, jobs, chunksize=2)
+    good = sum(1 for x in res if x); print(f"plotted {good}/{len(jobs)} maps in {time.time()-t:.0f}s")
     json.dump(man, open(f"{a.out}/manifest.json", "w"), ensure_ascii=False, indent=1)
-    if not man["models"]: sys.exit(1)
+    if not man["models"] or good < 0.8 * len(jobs): sys.exit(1)
 
 if __name__ == "__main__": main()
