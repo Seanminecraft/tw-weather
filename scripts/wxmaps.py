@@ -164,15 +164,29 @@ def plot(job):
     except Exception as e:
         plt.close("all"); print("map failed", job[:4], type(e).__name__, e, flush=True); return None
 
+SHP = {}   # 主程式預先讀好的海岸線／國界（fork 後子程序直接沿用，不會再碰 shapefile）
+NE = [("physical", "coastline", "50m"), ("physical", "coastline", "110m"), ("cultural", "admin_0_boundary_lines_land", "50m"), ("cultural", "admin_0_boundary_lines_land", "110m")]
+
 def prefetch_shapes():
-    """先在主程式下載海岸線／國界（避免多個子程序同時下載、讀到一半的檔案）。"""
-    for res in ("10m", "50m", "110m"):
-        for f in (cf.COASTLINE.with_scale(res), cf.BORDERS.with_scale(res)):
-            for _ in range(3):
-                try: list(f.geometries()); break
-                except Exception as e:
-                    print("shape retry", res, e)
-                    import shutil, cartopy; shutil.rmtree(os.path.join(cartopy.config["data_dir"], "shapefiles"), ignore_errors=True)
+    """序列下載 Natural Earth，逐檔用 shapefile.Reader 完整讀過驗證；壞掉就刪除重抓。"""
+    import cartopy, shapefile, shutil
+    import cartopy.io.shapereader as shpreader
+    from cartopy.feature import ShapelyFeature
+    for cat, name, res in NE:
+        for k in range(4):
+            try:
+                path = shpreader.natural_earth(resolution=res, category=cat, name=name)
+                with shapefile.Reader(path) as r:
+                    n = len(r.shapes())
+                    if n == 0 or len(r.records()) != n: raise ValueError("empty/inconsistent")
+                geoms = list(shpreader.Reader(path).geometries())
+                SHP[(name, res)] = ShapelyFeature(geoms, ccrs.PlateCarree(), facecolor="none", edgecolor="k")
+                print(f"shapes ok: {res} {name} ({n})"); break
+            except Exception as e:
+                print(f"shapes bad: {res} {name}: {type(e).__name__} {e}; redownload")
+                base = os.path.join(cartopy.config["data_dir"], "shapefiles", "natural_earth", cat)
+                for f in glob.glob(os.path.join(base, f"ne_{res}_{name}.*")): os.remove(f)
+        else: raise RuntimeError(f"cannot get Natural Earth {res} {name}")
 
 def _plot(job):
     model, dk, lk, s, out = job
@@ -217,7 +231,8 @@ def _plot(job):
             ax.streamplot(lon, lat, U, V, density=1.4 if dk != "tw" else 1, color="0.3", linewidth=.5, transform=pc)
     except TypeError:
         ax.text(.5, .5, "此時間資料暫缺", transform=ax.transAxes, ha="center", fontsize=18, color="r")
-    ax.coastlines("50m" if dk != "wnp" else "110m", linewidth=.7); ax.add_feature(cf.BORDERS, linewidth=.3)
+    rs = "50m" if dk != "wnp" else "110m"
+    ax.add_feature(SHP[("coastline", rs)], linewidth=.7); ax.add_feature(SHP[("admin_0_boundary_lines_land", rs)], linewidth=.3)
     gl = ax.gridlines(draw_labels=True, linewidth=.3, color="gray", alpha=.5); gl.top_labels = gl.right_labels = False
     ax.plot(121.0, 23.7, "r*", ms=8 if dk != "wnp" else 6, transform=pc)
     ax.text(121.6, 23.2 if dk == "tw" else 22.2, "台灣", color="r", fontsize=10, fontweight="bold", transform=pc)
@@ -232,6 +247,11 @@ def _plot(job):
 def main():
     ap = argparse.ArgumentParser(); ap.add_argument("--out", default="wxmaps"); ap.add_argument("--workers", type=int, default=os.cpu_count())
     ap.add_argument("--cache", default="wx_cache"); a = ap.parse_args()
+    print("wxmaps v3", flush=True)
+    import cartopy
+    cartopy.config["data_dir"] = os.path.abspath(os.environ.get("WXMAPS_SHAPES", "ne_data"))
+    os.makedirs(cartopy.config["data_dir"], exist_ok=True)
+    prefetch_shapes()
     font(); os.makedirs(a.out, exist_ok=True); os.makedirs(a.cache, exist_ok=True)
     for f in glob.glob(f"{a.out}/*.png"): os.remove(f)
     man = {"generated": dt.datetime.now(UTC).strftime("%Y-%m-%dT%H:%MZ"), "steps": STEPS,
@@ -256,8 +276,10 @@ def main():
         except Exception as e: print(model, "failed:", e)
     jobs = [(mo, dk, lk, s, a.out) for mo in man["models"] for dk in DOM for lk in LAY for s in man["models"][mo]["steps"]]
     t = time.time()
-    prefetch_shapes()
-    with Pool(a.workers, maxtasksperchild=40) as p: res = p.map(plot, jobs, chunksize=2)
+    try:
+        with Pool(a.workers, maxtasksperchild=40) as p: res = p.map(plot, jobs, chunksize=2)
+    except Exception as e:
+        print("pool failed, plotting serially:", type(e).__name__, e, flush=True); res = [plot(j) for j in jobs]
     good = sum(1 for x in res if x); print(f"plotted {good}/{len(jobs)} maps in {time.time()-t:.0f}s")
     json.dump(man, open(f"{a.out}/manifest.json", "w"), ensure_ascii=False, indent=1)
     if not man["models"] or good < 0.8 * len(jobs): sys.exit(1)
