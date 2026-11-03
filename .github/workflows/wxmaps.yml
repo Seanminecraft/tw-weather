@@ -1,0 +1,44 @@
+# 🗺️ 天氣圖：每天抓一次 ECMWF Open Data 與 NOAA GFS（免金鑰），畫 7 日預報天氣圖
+# 圖片放在獨立的「wxmaps」分支，每次整個覆蓋（只保留最新一份，不會讓 repo 越來越大；main 分支完全不動）
+# 網頁直接讀 raw.githubusercontent.com/<帳號>/tw-weather/wxmaps/（備援 jsDelivr）；tw-weather.yml 不用改
+name: wxmaps
+on:
+  schedule:
+    - cron: '30 8 * * *'   # 每天 08:30 UTC＝台灣時間 16:30（當天 00Z 模式已出齊）
+  workflow_dispatch:
+concurrency:
+  group: wxmaps
+  cancel-in-progress: true
+permissions:
+  contents: write
+jobs:
+  maps:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: scripts/wxmaps-requirements.txt
+      - name: 地圖海岸線快取
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/cartopy
+          key: cartopy-ne-v1
+      - name: 安裝中文字型與套件
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq fonts-noto-cjk >/dev/null
+          pip install -q -r scripts/wxmaps-requirements.txt
+      - name: 下載資料並畫圖
+        run: python scripts/wxmaps.py --out out/wxmaps --cache wx_cache --workers 4
+      - name: 發布到 wxmaps 分支（強制覆蓋、不留歷史）
+        run: |
+          cd out/wxmaps
+          git init -q -b wxmaps
+          git config user.name "wxmaps-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add -A
+          git commit -q -m "天氣圖 $(date -u +%F)"
+          git push -q --force "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" wxmaps
