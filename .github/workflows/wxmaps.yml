@@ -1,4 +1,4 @@
-# 🗺️ 天氣圖：每天抓一次 ECMWF Open Data 與 NOAA GFS（免金鑰），畫 7 日預報天氣圖
+# 🗺️ 天氣圖（wxmaps.yml v4）：每天抓一次 ECMWF Open Data 與 NOAA GFS（免金鑰），畫 7 日預報天氣圖
 # 圖片放在獨立的「wxmaps」分支，每次整個覆蓋（只保留最新一份，不會讓 repo 越來越大；main 分支完全不動）
 # 網頁直接讀 raw.githubusercontent.com/<帳號>/tw-weather/wxmaps/（備援 jsDelivr）；tw-weather.yml 不用改
 name: wxmaps
@@ -21,16 +21,24 @@ jobs:
         with:
           python-version: '3.12'
           cache: pip
-          cache-dependency-path: scripts/wxmaps-requirements.txt
+          cache-dependency-path: .github/workflows/wxmaps.yml
       - name: 地圖海岸線快取（v3：新位置、新名稱，不會用到舊快取）
         uses: actions/cache@v4
         with:
           path: ne_data
           key: wxmaps-ne-v3
+      - name: 檢查程式版本（必須是 v4）
+        run: |
+          head -3 scripts/wxmaps.py
+          if ! grep -q "wxmaps v4" scripts/wxmaps.py; then
+            echo "::error::scripts/wxmaps.py 還是舊版！請用 wxmaps.py.txt 的內容整個取代 GitHub 上的 scripts/wxmaps.py（第 2 行要是 # wxmaps v4）"
+            exit 1
+          fi
       - name: 安裝中文字型與套件
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq fonts-noto-cjk >/dev/null
-          pip install -q -r scripts/wxmaps-requirements.txt
+          pip install -q "numpy>=1.26,<3" "scipy>=1.11,<2" "requests>=2.31" "matplotlib>=3.8,<4" "cartopy>=0.23,<1" \
+            "pyshp>=2.3" "shapely>=2.0" "pyproj>=3.6" "eccodes>=1.7,<3" "ecmwflibs>=0.6" "ecmwf-opendata>=0.3" "pillow>=10"
       - name: 下載資料並畫圖
         env:
           WXMAPS_SHAPES: ne_data
