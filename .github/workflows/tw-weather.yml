@@ -170,6 +170,16 @@ jobs:
           MPLBACKEND: Agg
         run: python scripts/tw_rainmap.py --out site
 
+      # 日本場館：沿用既有更新節奏，無新排程、套件或金鑰。
+      - name: Comiket 日本場館（JMA XML + RJTT METAR）
+        if: steps.quick.outputs.skip != 'true'
+        continue-on-error: true
+        timeout-minutes: 3
+        run: |
+          mkdir -p site/data
+          if [ -s prev/data/comiket.json ]; then cp -p prev/data/comiket.json site/data/comiket.json; fi
+          if [ -d prev ]; then python scripts/jma_comiket.py --out site --prev-dir prev; else python scripts/jma_comiket.py --out site; fi
+
       - name: 網站大小
         if: steps.quick.outputs.skip != 'true'
         run: du -sh site site/img/history site/data || true
