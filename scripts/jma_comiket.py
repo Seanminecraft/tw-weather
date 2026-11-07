@@ -11,9 +11,12 @@ Usage: python jma_comiket.py --out site [--prev-dir prev] [--fixtures DIR] [--no
 import argparse, json, math, os, re, sys, urllib.request, datetime as dt
 import xml.etree.ElementTree as ET
 
-VERSION = "comiket-1.0"
+VERSION = "comiket-2.0"
 FEED_EXTRA = "https://www.data.jma.go.jp/developer/xml/feed/extra_l.xml"
 FEED_REGULAR = "https://www.data.jma.go.jp/developer/xml/feed/regular_l.xml"
+MODEL_URL = ("https://api.open-meteo.com/v1/forecast?latitude=35.63205&longitude=139.7978"
+             "&hourly=temperature_2m,relative_humidity_2m,apparent_temperature,precipitation_probability,precipitation,"
+             "weather_code,wind_speed_10m,wind_direction_10m&wind_speed_unit=ms&timezone=Asia%2FTaipei&forecast_days=7&models=best_match")
 METAR_URL = "https://aviationweather.gov/api/data/metar?ids=RJTT&format=json&hours=2"
 PREF, CITY, CITY_NAME = "130000", "1310800", "江東区"
 FC_AREA, FC_POINT = "130010", "44132"
@@ -31,6 +34,34 @@ ZH = {"02": "暴風雪警報", "03": "大雨警報（警戒等級3）", "05": "�
       "32": "暴風雪特別警報", "33": "大雨特別警報（警戒等級5）", "35": "暴風特別警報", "36": "大雪特別警報", "37": "波浪特別警報",
       "38": "高潮特別警報（警戒等級5）", "39": "土砂災害特別警報（警戒等級5）", "43": "大雨危險警報（警戒等級4）",
       "48": "高潮危險警報（警戒等級4）", "49": "土砂災害危險警報（警戒等級4）"}
+EMOJI = {"03": "🌧", "10": "🌧", "33": "🌧", "43": "🌧", "09": "⛰", "29": "⛰", "39": "⛰", "49": "⛰",
+         "08": "🌊", "19": "🌊", "38": "🌊", "48": "🌊", "07": "🌊", "16": "🌊", "37": "🌊",
+         "05": "💨", "15": "💨", "35": "💨", "02": "🌨", "13": "🌨", "32": "🌨", "06": "❄️", "12": "❄️", "36": "❄️",
+         "14": "⚡", "20": "🌫", "21": "🍂", "23": "🥶", "24": "🥶", "25": "🧊", "26": "🧊", "17": "💧", "22": "🏔"}
+TIER_ZH = {"advisory": "注意報", "warning": "警報", "danger": "危險警報", "special": "特別警報"}
+_WX = [("雷を伴う", "伴隨雷"), ("雷雨", "雷雨"), ("暴風雨", "暴風雨"), ("暴風雪", "暴風雪"), ("みぞれ", "雨夾雪"),
+       ("所により", "局部"), ("時々", "時"), ("一時", "短暫"), ("後", "轉"), ("のち", "轉"),
+       ("晴れ", "晴"), ("くもり", "多雲"), ("曇り", "多雲"), ("雨", "雨"), ("雪", "雪"), ("霧", "霧"), ("雷", "雷"),
+       ("昼過ぎ", "午後"), ("昼前", "上午"), ("夕方", "傍晚"), ("夜遅く", "深夜"), ("明け方", "清晨"),
+       ("朝晩", "早晚"), ("朝", "早晨"), ("夜", "夜間"), ("晩", "晚間"), ("日中", "白天"), ("から", "起"), ("で", ""), ("強く", "強"), ("降る", "")]
+def wx_zh(t):
+    """JMA 天気 text -> zh-TW (token translation; unknown tokens left as-is)."""
+    if not t: return None
+    out = t.replace("\u3000", " ")
+    for a, b in _WX: out = out.replace(a, b)
+    return out.replace(" ", "")
+_DIR = {"北東": "東北", "南東": "東南", "北西": "西北", "南西": "西南", "北": "北", "南": "南", "東": "東", "西": "西"}
+def dir_zh(d): return _DIR.get(d, d) if d else None
+# WMO weather interpretation codes (Open-Meteo docs) -> zh-TW
+WMO_ZH = {0: "晴", 1: "晴時多雲", 2: "多雲", 3: "陰", 45: "霧", 48: "霧（霧淞）", 51: "毛毛雨", 53: "毛毛雨", 55: "較強毛毛雨",
+          56: "凍毛毛雨", 57: "凍毛毛雨", 61: "小雨", 63: "雨", 65: "大雨", 66: "凍雨", 67: "凍雨", 71: "小雪", 73: "雪", 75: "大雪",
+          77: "霰", 80: "短暫陣雨", 81: "陣雨", 82: "強陣雨", 85: "陣雪", 86: "強陣雪", 95: "雷雨", 96: "雷雨伴冰雹", 99: "強雷雨伴冰雹"}
+WMO_EMOJI = {0: "☀️", 1: "🌤", 2: "⛅", 3: "☁️", 45: "🌫", 48: "🌫"}
+def wmo_emoji(c):
+    if c in WMO_EMOJI: return WMO_EMOJI[c]
+    if c >= 95: return "⛈"
+    if 71 <= c <= 77 or c in (85, 86): return "❄️"
+    return "🌧"
 def tier(code):
     c = int(code)
     if c >= 32 and c <= 39: return "special"      # 特別警報 / レベル５
@@ -52,7 +83,7 @@ class Src:
     def get(s, url):
         if s.fx:
             p = os.path.join(s.fx, url.rstrip("/").split("/")[-1].split("?")[0])
-            alias = {"extra_l.xml": "xml_extra.xml", "regular_l.xml": "xml_regular.xml", "metar": "metar.json"}
+            alias = {"extra_l.xml": "xml_extra.xml", "regular_l.xml": "xml_regular.xml", "metar": "metar.json", "forecast": "openmeteo.json"}
             p2 = os.path.join(s.fx, alias.get(os.path.basename(p), os.path.basename(p)))
             with open(p2, "rb") as f: return f.read()
         req = urllib.request.Request(url, headers={"User-Agent": "tw-doujin-event-weather (github actions)"})
@@ -125,6 +156,7 @@ def warnings(src, prev, now=None):
             if k.get("status") in ACTIVE and k.get("code"):
                 ti = tier(k["code"])
                 out["active"].append({"code": k["code"], "nameJa": k["name"], "nameZh": ZH.get(k["code"], k["name"]),
+                    "emoji": EMOJI.get(k["code"], "⚠️"), "tierZh": TIER_ZH[ti],
                     "status": k["status"], "tier": ti, "level": TIER_LEVEL[ti], "group": t,
                     "issuedAt": g["reportTime"], "sourceUrl": g["sourceUrl"],
                     "carried": g["state"] == "carried", "lastVerifiedAt": g.get("lastVerifiedAt")})
@@ -158,7 +190,7 @@ def forecast(src, now=None):
             ids = sorted(tdef, key=int)
             row = lambda i: {"start": tpe(tdef[i].get("DateTime")), "label": tdef[i].get("Name")}
             if "天気" in vals and "天気予報用テロップ番号" in vals:
-                res["periods"] = [dict(row(i), weather=vals["天気"].get(i), weatherCode=vals["天気予報用テロップ番号"].get(i)) for i in ids]
+                res["periods"] = [dict(row(i), weather=vals["天気"].get(i), weatherZh=wx_zh(vals["天気"].get(i)), weatherCode=vals["天気予報用テロップ番号"].get(i)) for i in ids]
             elif "６時間降水確率" in vals:
                 res["pop6h"] = [dict(row(i), label=None, popPct=int(vals["６時間降水確率"][i]) if vals["６時間降水確率"].get(i) else None) for i in ids]
             elif "朝の最低気温" in vals or "日中の最高気温" in vals:
@@ -166,7 +198,8 @@ def forecast(src, now=None):
                     for k in ("朝の最低気温", "日中の最高気温"):
                         if vals.get(k, {}).get(i) is not None: res["minMax"].append(dict(row(i), kind=k, tempC=int(vals[k][i])))
             elif "天気" in vals and "風向" in vals:
-                for i in ids: res["threeHourly"].append(dict(row(i), weather=vals["天気"].get(i), windDir=vals["風向"].get(i),
+                for i in ids: res["threeHourly"].append(dict(row(i), weather=vals["天気"].get(i), weatherZh=wx_zh(vals["天気"].get(i)),
+                                    windDir=vals["風向"].get(i), windDirZh=dir_zh(vals["風向"].get(i)),
                                     windSpeedLevel=vals.get("風速階級", {}).get(i)))
             elif "気温" in vals:
                 tmap = {tpe(tdef[i]["DateTime"]): int(vals["気温"][i]) for i in ids if vals["気温"].get(i)}
@@ -179,6 +212,100 @@ def forecast(src, now=None):
     elif not res.get("issuedAt"): res["state"] = "error"; res["reason"] = "無發布時間"
     for r3 in res["threeHourly"]: r3["tempC_point"] = tm.get(r3["start"])
     return res
+
+def weekly(src, now=None):
+    """府県週間天気予報 VPFW50_130000: 東京地方 daily weather/PoP/reliability; 東京 point min/max (+range, normals)."""
+    best = feed_latest(src.get(FEED_REGULAR), r"_(VPFW50)_" + PREF + r"\.xml$")
+    if "VPFW50" not in best: return {"state": "unavailable", "reason": "feed 中無府県週間天気予報"}
+    url = best["VPFW50"][1]; r = ET.fromstring(src.get(url)); rep = None
+    for e in r.iter():
+        if L(e) == "ReportDateTime": rep = e.text; break
+    days = {}
+    for ts in r.iter():
+        if L(ts) != "TimeSeriesInfo": continue
+        tdef = {t.get("timeId"): {L(c): c.text for c in t} for t in ts.iter() if L(t) == "TimeDefine"}
+        for it in ts:
+            if L(it) != "Item": continue
+            codes = [c.text for c in it.iter() if L(c) == "Code" and c.text in (FC_AREA, FC_POINT)]
+            if not codes: continue
+            for c in it.iter():
+                i, ty = c.get("refID"), c.get("type")
+                if not i or not ty or i not in tdef: continue
+                day = tdef[i]["DateTime"][:10]; d = days.setdefault(day, {"dateJst": day})
+                v = c.text
+                key = {"基本天気": "weather", "天気予報用テロップ番号": "weatherCode", "日降水確率": "popPct", "信頼度階級": "reliability",
+                       "最低気温": "minC", "最高気温": "maxC", "最低気温予測範囲（上端）": "minHiC", "最低気温予測範囲（下端）": "minLoC",
+                       "最高気温予測範囲（上端）": "maxHiC", "最高気温予測範囲（下端）": "maxLoC",
+                       "最低気温平年値": "normalMinC", "最高気温平年値": "normalMaxC"}.get(ty)
+                if not key: continue
+                if v is None or v == "": d.setdefault(key, None); continue
+                d[key] = float(v) if key.startswith("normal") else (int(v) if key not in ("weather", "weatherCode", "reliability") else v)
+    out = []
+    for k in sorted(days):
+        d = days[k]; d["weatherZh"] = wx_zh(d.get("weather"))
+        for f in ("weather", "weatherCode", "popPct", "reliability", "minC", "maxC", "minHiC", "minLoC", "maxHiC", "maxLoC"): d.setdefault(f, None)
+        out.append(d)
+    res = {"state": "ok", "sourceUrl": url, "issuedAt": tpe(rep), "region": {"code": FC_AREA, "name": "東京地方"},
+           "point": {"code": FC_POINT, "name": "東京（大手町）", "note": "氣溫為東京點預報，非場館點"},
+           "dateBasis": "日本時間（JST）日界", "units": {"temp": "°C", "pop": "%（日降水確率）"},
+           "reliabilityNote": "信頼度階級 A（高）/B/C（低），首日起無值者為 null", "days": out}
+    if rep and now and (now - dt.datetime.fromisoformat(rep)).total_seconds() > 30 * 3600:
+        res["state"] = "stale"; res["reason"] = "週間預報發布已超過 30 小時"
+    return res
+
+def model(src, now):
+    """Open-Meteo forecast API (documented, keyless). MODEL guidance, not JMA official."""
+    d = json.loads(src.get(MODEL_URL)); h = d.get("hourly") or {}
+    if d.get("error") or not h.get("time"): return {"state": "unavailable", "reason": d.get("reason") or "無模式資料"}
+    hrs = []
+    cutoff = now - dt.timedelta(hours=1)
+    for i, t in enumerate(h["time"]):
+        if dt.datetime.fromisoformat(t + "+08:00") < cutoff: continue
+        g = lambda k: (h.get(k) or [None] * len(h["time"]))[i]
+        code = g("weather_code"); wd = g("wind_direction_10m")
+        wxz = WMO_ZH.get(code) if code is not None else None
+        hrs.append({"time": t + "+08:00", "tempC": g("temperature_2m"), "rhPct": g("relative_humidity_2m"),
+                    "apparentTempC": g("apparent_temperature"), "popPct": g("precipitation_probability"),
+                    "precipMmForecast": g("precipitation"), "weatherCode": code, "weatherZh": wxz,
+                    "emoji": wmo_emoji(code) if code is not None else None, "windMs": g("wind_speed_10m"), "windDirDeg": wd,
+                    "windDirZh": DIR16[int((wd % 360) / 22.5 + 0.5) % 16] if wd is not None else None,
+                    "suitabilityInputs": {"temp": g("temperature_2m"), "wx": wxz, "pop": g("precipitation_probability"),
+                                          "healthRow": None, "aqi": None, "pm25": None}})
+    return {"state": "ok", "official": False, "provider": "Open-Meteo", "model": "best_match（Open-Meteo 自動選擇模式）",
+            "sourceUrl": MODEL_URL, "sourceLabel": "模式預報：Open-Meteo（CC BY 4.0），非日本氣象廳官方預報",
+            "fetchedAt": now.astimezone(TPE).isoformat(timespec="minutes"),
+            "grid": {"lat": d.get("latitude"), "lon": d.get("longitude"), "elevationM": d.get("elevation"),
+                     "requested": {"lat": 35.63205, "lon": 139.7978}},
+            "units": {"temp": "°C", "rh": "%", "pop": "%", "precip": "mm/h（模式預報量，非觀測）", "wind": "m/s"},
+            "suitabilityNote": "健康天氣、空品無日本對應資料 → 傳 null（前端計分以中性處理）",
+            "hourly": hrs}
+
+def jst_date(iso):
+    if not iso: return None
+    return dt.datetime.fromisoformat(iso).astimezone(dt.timezone(dt.timedelta(hours=9))).date().isoformat()
+
+def summary(fc, wk, md):
+    """today/tomorrow cards: official JMA first; model only fills labelled extra fields."""
+    out = []
+    per = {p["label"]: p for p in fc.get("periods", [])} if isinstance(fc, dict) else {}
+    mm = {m["kind"]: m["tempC"] for m in fc.get("minMax", [])} if isinstance(fc, dict) else {}
+    days = [x for x in (wk.get("days") or [])] if isinstance(wk, dict) else []
+    for label, key in (("今天", "今日"), ("明天", "明日")):
+        p = per.get(key) or (per.get("今夜") if key == "今日" else None)
+        if not p: continue
+        day = jst_date(p.get("start"))
+        card = {"label": label, "official": {"weather": p.get("weather"), "weatherZh": p.get("weatherZh"), "weatherCode": p.get("weatherCode"),
+                "source": "JMA 府県天気予報", "periodJa": p.get("label")}}
+        if key == "明日":
+            card["official"].update(minC=mm.get("朝の最低気温"), maxC=mm.get("日中の最高気温"))
+        if isinstance(md, dict) and md.get("hourly"):
+            tt = [x["tempC"] for x in md["hourly"] if jst_date(x["time"]) == day and x["tempC"] is not None]
+            pp = [x["popPct"] for x in md["hourly"] if jst_date(x["time"]) == day and x["popPct"] is not None]
+            card["model"] = {"minC": min(tt) if tt else None, "maxC": max(tt) if tt else None, "maxPopPct": max(pp) if pp else None,
+                             "source": "Open-Meteo 模式", "dateBasis": "日本時間日界（與官方一致）",
+                             "coversRemainingHoursOnly": label == "今天"}
+        out.append(card)
+    return out
 
 DIR16 = ["北", "北北東", "東北", "東北東", "東", "東南東", "東南", "南南東", "南", "南南西", "西南", "西南西", "西", "西北西", "西北", "北北西"]
 def rh_magnus(t, td):
@@ -223,19 +350,26 @@ def build(src, now, prev=None):
            "event": {"name": "コミックマーケット109", "start": "2026-12-29", "end": "2026-12-31",
                      "source": "https://www.comiket.co.jp/", "note": "以主辦單位公告為準"},
            "disclaimer": "資料僅供參考，實際以日本氣象廳最新發布為準。",
-           "attribution": ["出典：気象庁（防災情報XML）", "觀測替代：NOAA AviationWeather（RJTT METAR）", "© OpenStreetMap contributors"]}
-    for k, fn in (("warnings", lambda: warnings(src, prev, now)), ("forecast", lambda: forecast(src, now)), ("observation", lambda: observation(src, now))):
+           "attribution": ["出典：気象庁（防災情報XML）", "觀測替代：NOAA AviationWeather（RJTT METAR）", "© OpenStreetMap contributors"],
+           "footerLines": ["出典：気象庁（防災情報XML）；觀測替代：NOAA AviationWeather（RJTT METAR）；© OpenStreetMap contributors",
+                           "資料僅供參考，實際以日本氣象廳最新發布為準。"],
+           "modelAttribution": "模式預報：Open-Meteo（CC BY 4.0）"}
+    for k, fn in (("warnings", lambda: warnings(src, prev, now)), ("forecast", lambda: forecast(src, now)),
+                  ("weekly", lambda: weekly(src, now)), ("model", lambda: model(src, now)), ("observation", lambda: observation(src, now))):
         try: out[k] = fn()
         except Exception as ex: out[k] = (prev or {}).get(k) or {}; out[k] = dict(out[k], state="error", reason=type(ex).__name__)
     start = dt.datetime.fromisoformat(out["event"]["start"] + "T00:00:00+09:00")
     end = dt.datetime.fromisoformat(out["event"]["end"] + "T23:59:59+09:00")
     days = (start - now).total_seconds() / 86400
     out["event"]["daysUntilStart"] = round(days, 1)
-    last = max([dt.datetime.fromisoformat(p["start"]) for p in out["forecast"].get("periods", []) if p.get("start")] or [now])
+    cand = [dt.datetime.fromisoformat(p["start"]) for p in out["forecast"].get("periods", []) if p.get("start")]
+    cand += [dt.datetime.fromisoformat(x["dateJst"] + "T00:00:00+09:00") for x in out["weekly"].get("days", [])]
+    last = max(cand or [now])
     if now > end: note = "場次已結束；以下為現況與近期預報"
     elif last + dt.timedelta(days=1) < start: note = "現況與近期預報；場次期間尚未進入可預報範圍"
     else: note = "預報期間已涵蓋部分場次日期"
     out["forecast"]["note"] = note
+    out["summary"] = summary(out["forecast"], out["weekly"], out["model"])
     return out
 
 def main(argv=None):
@@ -252,6 +386,6 @@ def main(argv=None):
     dst = os.path.join(a.out, "data", "comiket.json")
     with open(dst + ".tmp", "w", encoding="utf-8") as f: json.dump(d, f, ensure_ascii=False, indent=1)
     os.replace(dst + ".tmp", dst)  # atomic: never publish a half-written file
-    print("comiket.json: warnings active=%d complete=%s obs=%s fc=%s" % (len(d["warnings"].get("active", [])),
-          d["warnings"].get("complete"), d["observation"].get("state"), d["forecast"].get("state")))
+    print("comiket.json: warnings active=%d complete=%s obs=%s fc=%s weekly=%s model=%s" % (len(d["warnings"].get("active", [])),
+          d["warnings"].get("complete"), d["observation"].get("state"), d["forecast"].get("state"), d["weekly"].get("state"), d["model"].get("state")))
 if __name__ == "__main__": main()
