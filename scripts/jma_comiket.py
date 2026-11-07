@@ -11,7 +11,7 @@ Usage: python jma_comiket.py --out site [--prev-dir prev] [--fixtures DIR] [--no
 import argparse, json, math, os, re, sys, urllib.request, datetime as dt
 import xml.etree.ElementTree as ET
 
-VERSION = "comiket-2.0"
+VERSION = "comiket-4.0"
 FEED_EXTRA = "https://www.data.jma.go.jp/developer/xml/feed/extra_l.xml"
 FEED_REGULAR = "https://www.data.jma.go.jp/developer/xml/feed/regular_l.xml"
 MODEL_URL = ("https://api.open-meteo.com/v1/forecast?latitude=35.63205&longitude=139.7978"
@@ -82,6 +82,10 @@ class Src:
     def __init__(s, fixtures=None): s.fx = fixtures
     def get(s, url):
         if s.fx:
+            if "open-meteo.com" in url:
+                mm = re.search(r"[?&]models=([^&]+)", url); mt = re.search(r"/data/([^/]+)/static/meta\.json", url)
+                name = ("meta_%s.json" % mt.group(1)) if mt else ("openmeteo.json" if mm and mm.group(1) == "best_match" else "om_%s.json" % mm.group(1))
+                with open(os.path.join(s.fx, name), "rb") as f: return f.read()
             p = os.path.join(s.fx, url.rstrip("/").split("/")[-1].split("?")[0])
             alias = {"extra_l.xml": "xml_extra.xml", "regular_l.xml": "xml_regular.xml", "metar": "metar.json", "forecast": "openmeteo.json"}
             p2 = os.path.join(s.fx, alias.get(os.path.basename(p), os.path.basename(p)))
@@ -355,7 +359,7 @@ def build(src, now, prev=None):
                            "資料僅供參考，實際以日本氣象廳最新發布為準。"],
            "modelAttribution": "模式預報：Open-Meteo（CC BY 4.0）"}
     for k, fn in (("warnings", lambda: warnings(src, prev, now)), ("forecast", lambda: forecast(src, now)),
-                  ("weekly", lambda: weekly(src, now)), ("model", lambda: model(src, now)), ("observation", lambda: observation(src, now))):
+                  ("weekly", lambda: weekly(src, now)), ("ensemble", lambda: ensemble(src, now, prev)), ("model", lambda: model(src, now)), ("observation", lambda: observation(src, now))):
         try: out[k] = fn()
         except Exception as ex: out[k] = (prev or {}).get(k) or {}; out[k] = dict(out[k], state="error", reason=type(ex).__name__)
     start = dt.datetime.fromisoformat(out["event"]["start"] + "T00:00:00+09:00")
@@ -370,7 +374,203 @@ def build(src, now, prev=None):
     else: note = "預報期間已涵蓋部分場次日期"
     out["forecast"]["note"] = note
     out["summary"] = summary(out["forecast"], out["weekly"], out["model"])
+    if isinstance(out.get("ensemble"), dict) and "models" in out["ensemble"]:
+        out["ensemble"]["jmaOfficialMarkers"] = [{"dateJst": x["dateJst"], "minC": x.get("minC"), "maxC": x.get("maxC"),
+            "label": "日本氣象廳官方 東京點 最低/最高（日本時間日界，非逐時）"} for x in out["weekly"].get("days", []) if x.get("minC") is not None or x.get("maxC") is not None]
     return out
+
+# ============================ v4: multi-model ensemble / deterministic charts ============================
+# Source: Open-Meteo Forecast API + Ensemble API (documented, keyless, CC BY 4.0, free tier non-commercial).
+# Same provider and model ids as the Taiwan dashboard (multimodel.gs); here fetched for the Tokyo venue point only.
+OM_LAT, OM_LON = 35.63205, 139.7978
+ENS_MODELS = [  # id, display, family, members, meta(ensemble host), gust requested
+    ("google_weathernext2_ensemble", "Google DeepMind WeatherNext 2 系集", "google", 64, "google_weathernext2_ensemble", False),
+    ("ecmwf_ifs025_ensemble", "ECMWF IFS 系集", "ecmwf_ifs", 51, "ecmwf_ifs025_ensemble", True),
+    ("ecmwf_aifs025_ensemble", "ECMWF AIFS 系集", "ecmwf_aifs", 51, "ecmwf_aifs025_ensemble", False),
+    ("ncep_gefs025", "NOAA GEFS 系集（GFS 系集版）", "gfs", 31, "ncep_gefs025", True),
+    ("ncep_aigefs025", "NOAA AIGEFS 系集（AIGFS 系集版）", "aigfs", 31, "ncep_aigefs025", False),
+    ("icon_seamless_eps", "DWD ICON-EPS 系集", "icon", 40, None, False),
+]
+DET_MODELS = [  # id, display, family, meta(forecast host)
+    ("ecmwf_ifs", "ECMWF IFS HRES", "ecmwf_ifs", "ecmwf_ifs"),
+    ("ecmwf_aifs025_single", "ECMWF AIFS（決定性）", "ecmwf_aifs", "ecmwf_aifs025_single"),
+    ("gfs_seamless", "NOAA GFS", "gfs", "ncep_gfs013"),
+    ("ncep_aigfs025", "NOAA AIGFS", "aigfs", "ncep_aigfs025"),
+    ("icon_seamless", "DWD ICON", "icon", "dwd_icon"),
+    ("jma_seamless", "日本氣象廳 JMA 模式（MSM＋GSM）", "jma", "jma_msm"),
+]
+FAMILIES = [  # user-named families -> what exists (capability table)
+    ("google", "Google DeepMind"), ("ecmwf_ifs", "ECMWF IFS"), ("ecmwf_aifs", "ECMWF AIFS"), ("gfs", "GFS"),
+    ("aigfs", "AIGFS"), ("icon", "ICON"), ("jma", "日本氣象廳")]
+ENS_URL = "https://ensemble-api.open-meteo.com/v1/ensemble"
+DET_URL = "https://api.open-meteo.com/v1/forecast"
+META_CHECK_MIN = 60      # look at meta.json at most hourly per model
+MAX_AGE_H = {"ens": 13, "det": 7}   # force refresh even without meta
+SLOT_H = 3
+
+def _q(vals, p):
+    s = sorted(vals); n = len(s)
+    if n == 1: return s[0]
+    k = (n - 1) * p; f = int(k); c = min(f + 1, n - 1)
+    return s[f] + (s[c] - s[f]) * (k - f)
+def _r(x): return None if x is None else round(x, 1)
+def _stats(rows):
+    """rows: list per time of member-value lists or None (incomplete) -> {p10,p50,p90}."""
+    out = {"p10": [], "p50": [], "p90": []}
+    for v in rows:
+        for k, p in (("p10", .1), ("p50", .5), ("p90", .9)): out[k].append(_r(_q(v, p)) if v else None)
+    return out
+def _iso(t): return t + ":00+08:00" if len(t) == 16 else t
+def _bins(times):
+    """3h slots in Asia/Taipei clock (00,03,...); precip at slot t = (t-3h, t]."""
+    return [i for i, t in enumerate(times) if int(t[11:13]) % SLOT_H == 0]
+def _daily_dates(times):
+    ds = sorted({t[:10] for t in times}); return ds
+
+def parse_ensemble(js, nmax=None):
+    h = js.get("hourly") or {}; times = h.get("time") or []
+    if not times: raise ValueError("no hourly")
+    def members(var):
+        ks = [k for k in h if k == var or k.startswith(var + "_member")]
+        return [h[k] for k in ks if any(v is not None for v in h[k])]
+    T, P, W, G = members("temperature_2m"), members("precipitation"), members("wind_speed_10m"), members("wind_gusts_10m")
+    def col(ms, i):
+        v = [m[i] for m in ms]
+        return None if (not ms or any(x is None for x in v)) else v   # complete across members only
+    idx = list(range(len(times)))  # ensemble requested at hourly_3 already
+    out = {"t": [_iso(times[i]) for i in idx], "members": len(T),
+           "temp": _stats([col(T, i) for i in idx]), "precip3h": _stats([col(P, i) for i in idx]),
+           "wind": _stats([col(W, i) for i in idx]) if W else None,
+           "gust": _stats([col(G, i) for i in idx]) if G else None}
+    # daily (Asia/Taipei calendar day): per member sum of the 8 bins ending 03..24h, all present, THEN quantiles
+    pos = {t: i for i, t in enumerate(times)}; days, dq = [], []
+    for d in _daily_dates(times):
+        nd = (dt.date.fromisoformat(d) + dt.timedelta(days=1)).isoformat()
+        need = ["%sT%02d:00" % (d, hh) for hh in range(3, 24, 3)] + [nd + "T00:00"]
+        if not all(k in pos for k in need): continue
+        sums = []
+        for m in P:
+            v = [m[pos[k]] for k in need]
+            if any(x is None for x in v): sums = None; break
+            sums.append(sum(v))
+        days.append(d); dq.append(sums)
+    out["daily"] = {"date": days, "precip": _stats(dq)}
+    return out
+
+def parse_det(js, mid, single):
+    h = js.get("hourly") or {}; times = h.get("time") or []
+    key = (lambda v: v) if single else (lambda v: v + "_" + mid)
+    g = lambda v: h.get(key(v)) or [None] * len(times)
+    T, P, W, G = g("temperature_2m"), g("precipitation"), g("wind_speed_10m"), g("wind_gusts_10m")
+    if not any(x is not None for x in T): raise ValueError("model returned no data")
+    idx = [i for i in _bins(times) if i >= 2]
+    def p3(i):
+        v = P[i - 2:i + 1]; return None if any(x is None for x in v) else round(sum(v), 1)
+    out = {"t": [_iso(times[i]) for i in idx], "members": 1,
+           "temp": {"value": [_r(T[i]) for i in idx]}, "precip3h": {"value": [p3(i) for i in idx]},
+           "wind": {"value": [_r(W[i]) for i in idx]} if any(x is not None for x in W) else None,
+           "gust": {"value": [_r(G[i]) for i in idx]} if any(x is not None for x in G) else None}
+    pos = {t: i for i, t in enumerate(times)}; days, vals = [], []
+    for d in _daily_dates(times):
+        nd = (dt.date.fromisoformat(d) + dt.timedelta(days=1)).isoformat()
+        need = ["%sT%02d:00" % (d, hh) for hh in range(1, 24)] + [nd + "T00:00"]
+        if not all(k in pos for k in need): continue
+        v = [P[pos[k]] for k in need]; days.append(d); vals.append(None if any(x is None for x in v) else round(sum(v), 1))
+    out["daily"] = {"date": days, "precip": {"value": vals}}
+    return out
+
+def _meta_init(src, host, meta):
+    j = json.loads(src.get(host + "/data/" + meta + "/static/meta.json"))
+    t = j.get("last_run_initialisation_time")
+    return dt.datetime.fromtimestamp(t, dt.timezone.utc).astimezone(TPE).isoformat(timespec="minutes") if t else None
+
+def _need(prev_m, init, now, kind):
+    if not prev_m or prev_m.get("state") not in ("ok", "cached"): return True, "無快取"
+    if init and init != prev_m.get("init"): return True, "新起報 " + init
+    age = (now - dt.datetime.fromisoformat(prev_m["retrievedAt"])).total_seconds() / 3600
+    if age > MAX_AGE_H[kind]: return True, "快取超過 %d 小時" % MAX_AGE_H[kind]
+    return False, "沿用快取（起報未變）"
+
+def ensemble(src, now, prev):
+    pe = ((prev or {}).get("ensemble") or {}).get("models") or {}
+    now_s = now.astimezone(TPE).isoformat(timespec="minutes"); models = {}; log = []
+    def meta_for(mid, host, meta):
+        p = pe.get(mid) or {}
+        if not meta: return None, p.get("init")
+        last = p.get("metaCheckedAt")
+        if last and (now - dt.datetime.fromisoformat(last)).total_seconds() < META_CHECK_MIN * 60:
+            return p.get("latestInit"), p.get("latestInit")
+        try: return _meta_init(src, host, meta), None
+        except Exception: return None, p.get("latestInit")
+    def keep(mid, why, extra=None):
+        p = dict(pe[mid]); p["state"] = "cached"; p["cacheReason"] = why; p.update(extra or {}); return p
+    for mid, name, fam, nmem, meta, gust in ENS_MODELS:
+        init, cached_init = meta_for(mid, "https://ensemble-api.open-meteo.com", meta)
+        need, why = _need(pe.get(mid), init or cached_init, now, "ens")
+        base = {"id": mid, "name": name, "family": fam, "kind": "ensemble", "official": False,
+                "metaCheckedAt": now_s if init else (pe.get(mid) or {}).get("metaCheckedAt"), "latestInit": init or cached_init}
+        if not need:
+            models[mid] = keep(mid, why, {k: v for k, v in base.items() if k in ("metaCheckedAt", "latestInit")}); log.append(mid + " 略過"); continue
+        vars_ = "temperature_2m,precipitation,wind_speed_10m" + (",wind_gusts_10m" if gust else "")
+        url = (ENS_URL + "?latitude=%s&longitude=%s&hourly=%s&models=%s&temporal_resolution=hourly_3&forecast_days=8"
+               "&wind_speed_unit=ms&timezone=Asia%%2FTaipei") % (OM_LAT, OM_LON, vars_, mid)
+        try:
+            js = json.loads(src.get(url))
+            if js.get("error"): raise ValueError(str(js.get("reason"))[:80])
+            d = parse_ensemble(js)
+            models[mid] = dict(base, state="ok", init=init or cached_init, retrievedAt=now_s, fetchReason=why, sourceUrl=url,
+                               grid={"lat": js.get("latitude"), "lon": js.get("longitude"), "elevationM": js.get("elevation")},
+                               expectedMembers=nmem, **d)
+            log.append(mid + " 抓取")
+        except Exception as ex:
+            models[mid] = keep(mid, "抓取失敗（%s），沿用上一版" % type(ex).__name__) if pe.get(mid, {}).get("t") else \
+                dict(base, state="error", reason=type(ex).__name__ + ": " + str(ex)[:80])
+    # deterministic: one request for models that need refresh
+    need_ids = []; dinit = {}
+    for mid, name, fam, meta in DET_MODELS:
+        init, cached_init = meta_for(mid, "https://api.open-meteo.com", meta); dinit[mid] = (init, cached_init)
+        n, why = _need(pe.get(mid), init or cached_init, now, "det")
+        if n: need_ids.append((mid, why))
+        else:
+            models[mid] = keep(mid, why, {"metaCheckedAt": now_s if init else pe[mid].get("metaCheckedAt"), "latestInit": init or cached_init})
+    if need_ids:
+        ids = ",".join(m for m, _ in need_ids)
+        url = (DET_URL + "?latitude=%s&longitude=%s&hourly=temperature_2m,precipitation,wind_speed_10m,wind_gusts_10m&models=%s"
+               "&forecast_days=8&wind_speed_unit=ms&timezone=Asia%%2FTaipei") % (OM_LAT, OM_LON, ids)
+        try:
+            js = json.loads(src.get(url)); err = js.get("reason") if js.get("error") else None
+        except Exception as ex: js, err = None, type(ex).__name__
+        for mid, why in need_ids:
+            name, fam = [(n, f) for m, n, f, _ in DET_MODELS if m == mid][0]; init, ci = dinit[mid]
+            base = {"id": mid, "name": name, "family": fam, "kind": "deterministic", "official": False,
+                    "metaCheckedAt": now_s if init else None, "latestInit": init or ci}
+            try:
+                if err: raise ValueError(err)
+                d = parse_det(js, mid, len(need_ids) == 1)
+                models[mid] = dict(base, state="ok", init=init or ci, retrievedAt=now_s, fetchReason=why, sourceUrl=url,
+                                   grid={"lat": js.get("latitude"), "lon": js.get("longitude"), "elevationM": js.get("elevation")}, **d)
+            except Exception as ex:
+                models[mid] = keep(mid, "抓取失敗（%s），沿用上一版" % type(ex).__name__) if pe.get(mid, {}).get("t") else \
+                    dict(base, state="error", reason=type(ex).__name__ + ": " + str(ex)[:80])
+    for m in models.values():
+        if m.get("retrievedAt"):
+            m["ageHours"] = round((now - dt.datetime.fromisoformat(m["retrievedAt"])).total_seconds() / 3600, 1)
+        m["capabilities"] = {k: bool(m.get(k)) for k in ("temp", "precip3h", "wind", "gust")} | {"dailyPrecip": bool((m.get("daily") or {}).get("date"))}
+    caps = []
+    for fam, label in FAMILIES:
+        ens = [m for m in models.values() if m["family"] == fam and m["kind"] == "ensemble"]
+        det = [m for m in models.values() if m["family"] == fam and m["kind"] == "deterministic"]
+        caps.append({"family": fam, "label": label, "ensemble": ens[0]["id"] if ens else None, "deterministic": det[0]["id"] if det else None,
+                     "note": {"google": "僅系集（WeatherNext 2）；無決定性版本、無陣風",
+                              "jma": "僅決定性（MSM/GSM，經 Open-Meteo）；JMA 系集（MEPS/GEPS）無免費文件化來源",
+                              "aigfs": "AI 模式無陣風", "ecmwf_aifs": "AI 模式無陣風"}.get(fam)})
+    return {"provider": "Open-Meteo", "attribution": "模式資料：Open-Meteo（CC BY 4.0）；各模式版權屬原機構",
+            "official": False, "timezone": "Asia/Taipei (+08:00)",
+            "binning": {"slotHours": 3, "precip3h": "時間 t 的值＝(t−3h, t] 累積雨量（mm）",
+                        "dailyPrecip": "臺北時間日界：當日 03:00…次日 00:00 共 8 個 3 小時（決定性為 24 個 1 小時）全部有值才計，先逐成員加總再取分位數",
+                        "wind": "10 m 風速 m/s，整點值（非區間平均）", "gust": "10 m 陣風 m/s，模式所給前 1 小時最大值於整點取樣；不加總",
+                        "quantiles": "同一系集各成員於同一時間的 P10/P50/P90；任一成員缺值則該時間為 null"},
+            "point": {"lat": OM_LAT, "lon": OM_LON}, "models": models, "capabilities": caps, "log": log}
 
 def main(argv=None):
     ap = argparse.ArgumentParser(); ap.add_argument("--out", required=True); ap.add_argument("--prev-dir")
