@@ -8,6 +8,7 @@
 # 輸出：https://<帳號>.github.io/tw-weather/manifest.json、img/latest/<變數>_<station|town>.png（固定網址）
 # v22.2 空品：air.json、img/latest/aq_<項目>_<station|town>.png、img/history_aq/（48h）；secrets.MOENV_API_KEY
 # v22.4 場館降雨地圖：img/rain/<場館>.png＋img/rain/manifest.json（每次 r10／full 都重畫）
+# v25 寒潮監測：data/coldsurge.json（scripts/coldsurge.py＋scripts/coldsurge_clim.json）
 # v22.3 10 分鐘雨量：cron 每 10 分鐘（:07 :17 … :57；S3 約晚 6 分鐘上檔）。每次自己判斷要做什麼：
 #   full ＝ 新的整點（或空品還沒更新）→ 全部重做（和以前一樣）＋ r10
 #   r10  ＝ 整點已是最新、只有 10 分鐘雨量是新的 → 沿用上一版網站（Actions artifact）只重畫 r10m 兩張圖＋資料
@@ -179,6 +180,20 @@ jobs:
           mkdir -p site/data
           if [ -s prev/data/comiket.json ]; then cp -p prev/data/comiket.json site/data/comiket.json; fi
           if [ -d prev ]; then python scripts/jma_comiket.py --out site --prev-dir prev; else python scripts/jma_comiket.py --out site; fi
+
+      # v25：寒潮監測（Open-Meteo 模式／系集、氣象署 S3＋低溫特報 W-C0033-004、NOAA METAR／CPC AO）
+      # 模式資料每 3 小時重抓一次（其餘時間沿用上一版）；特報與觀測每次都更新。只用 Python 標準函式庫，失敗不影響其他步驟。
+      - name: 寒潮監測（coldsurge.json）
+        if: steps.quick.outputs.skip != 'true'
+        continue-on-error: true
+        timeout-minutes: 4
+        env:
+          PAGES_BASE: ${{ steps.pages.outputs.base_url }}/
+          CWA_API_KEY: ${{ secrets.CWA_API_KEY }}
+        run: |
+          mkdir -p site/data
+          if [ -s prev/data/coldsurge.json ]; then cp -p prev/data/coldsurge.json site/data/coldsurge.json; fi
+          if [ -d prev ]; then python scripts/coldsurge.py --out site --prev-dir prev; else python scripts/coldsurge.py --out site; fi
 
       - name: 網站大小
         if: steps.quick.outputs.skip != 'true'
