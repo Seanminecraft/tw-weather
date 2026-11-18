@@ -5,6 +5,9 @@
 v5.1（2026-11-18）：新增 lowtemp 區塊＝各縣市「現在溫度／今日最低（實測）／未來 7 天預報最低溫」
   來源：氣象署 S3 公開鏡像 O-A0003-001（10 分鐘綜觀）＋O-A0001-001（自動站，逐時）＋F-D0047-091（縣市一週逐 12 小時預報）
   全部免金鑰、每次執行都更新；抓不到就留 null（頁面顯示「—」），絕不補 0。
+v5.2（2026-11-18）：lowtemp.towns＝全台 368 鄉鎮一週預報最低溫（每日取白天／晚上兩時段較低者）
+  來源：氣象署 S3 F-D0047-093.zip（各縣市鄉鎮一週日夜預報 XML 打包，約 4.8 MB）；
+  只在 F-D0047-091 發布時間改變（約每 6 小時）或上一版沒有時才下載，其他時候沿用上一版並裁掉已過去的日期。
 
 資料（全部免費；只有低溫特報 W-C0033-004 需要 secrets.CWA_API_KEY，金鑰絕不印出）：
   氣象署 S3 公開鏡像：C-B0024-001（30 天測站逐日統計）、O-A0003-001（10 分鐘綜觀）、W-C0033-001（備援：縣市目前特報）
@@ -18,7 +21,8 @@ v5.1（2026-11-18）：新增 lowtemp 區塊＝各縣市「現在溫度／今日
   light（低溫特報、目前觀測、METAR）：每次執行都更新。
   任何一段失敗 → 保留上一版該段並標 cached／stale；拿不到就標 error，絕不用 0 代替缺值。
 """
-import argparse, json, math, os, sys, time, urllib.request, urllib.parse
+import argparse, io, json, math, os, sys, time, urllib.request, urllib.parse, zipfile
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 
 SCHEMA = "coldsurge-1.0"
@@ -843,7 +847,121 @@ def week_days(periods, today, ndays=LT_DAYS):
     return days
 
 
-def build_lowtemp(now, F):
+# ---------------------------------------------------------------- v5.2 鄉鎮一週最低溫（F-D0047-093.zip）
+def _xt(el, name):
+    for c in el:
+        if c.tag.rsplit("}", 1)[-1] == name:
+            return c
+    return None
+
+
+def _xall(el, name):
+    return [c for c in el if c.tag.rsplit("}", 1)[-1] == name]
+
+
+def parse_town_xml(xml_bytes):
+    """一份縣市「一週日夜」XML → (county, issued, [(geocode, name, periods)])"""
+    root = ET.fromstring(xml_bytes)
+    ds = _xt(root, "Dataset")
+    if ds is None:
+        raise ValueError("XML 無 Dataset")
+    info = _xt(ds, "DatasetInfo")
+    issued = (_xt(info, "IssueTime").text if info is not None and _xt(info, "IssueTime") is not None else None)
+    locs = _xt(ds, "Locations")
+    county = (_xt(locs, "LocationsName").text or "").strip().replace("台", "臺")
+    towns = []
+    for L in _xall(locs, "Location"):
+        name = (_xt(L, "LocationName").text or "").strip()
+        code = (_xt(L, "Geocode").text or "").strip() if _xt(L, "Geocode") is not None else ""
+        per = []
+        for we in _xall(L, "WeatherElement"):
+            en = _xt(we, "ElementName")
+            if en is None or en.text not in ("最低溫度", "MinTemperature"):
+                continue
+            for t in _xall(we, "Time"):
+                st = parse_t((_xt(t, "StartTime").text if _xt(t, "StartTime") is not None else None))
+                ev = _xt(t, "ElementValue")
+                mv = _xt(ev, "MinTemperature") if ev is not None else None
+                v = num(mv.text if mv is not None else None)
+                if st is None:
+                    continue
+                per.append({"start": iso(st), "min": v if v is None or -20 <= v <= 40 else None})
+        towns.append((code, name, per))
+    return county, issued, towns
+
+
+def build_towns(zip_bytes, today):
+    """→ {"issued","dates":[...],"partial":[...],"c":{縣市:[[geocode,名稱,d1..dN],...]}}；值為整數或 null"""
+    z = zipfile.ZipFile(io.BytesIO(zip_bytes))
+    names = [n for n in z.namelist() if n.endswith("_Weekday_CH.xml") and not n.startswith("TAIWAN")]
+    if not names:
+        raise ValueError("F-D0047-093.zip 內沒有 *_Weekday_CH.xml")
+    raw, issued_all, dates = {}, [], set()
+    for n in names:
+        county, issued, towns = parse_town_xml(z.read(n))
+        if issued:
+            issued_all.append(issued)
+        rows = []
+        for code, name, per in towns:
+            days = week_days(per, today)
+            rows.append((code, name, {d["date"]: d for d in days}))
+            dates.update(d["date"] for d in days)
+        raw[county] = rows
+    dates = sorted(dates)[:LT_DAYS]
+    partial = []
+    for dt in dates:
+        ps = [r[2][dt]["partial"] for rows in raw.values() for r in rows if dt in r[2]]
+        partial.append(bool(ps) and all(ps))
+    out = {}
+    for county in COUNTIES:
+        if county not in raw:
+            continue
+        out[county] = [[code, name] + [(int(round(r[dt]["min"])) if dt in r and r[dt]["min"] is not None else None) for dt in dates]
+                       for code, name, r in raw[county]]
+    ntown = sum(len(v) for v in out.values())
+    return {"issued": iso(parse_t(max(issued_all))) if issued_all else None, "dates": dates, "partial": partial,
+            "n": ntown, "c": out}
+
+
+def trim_towns(T, today):
+    """沿用上一版時，把已過去的日期裁掉（午夜後到下一次發布前）"""
+    if not T or not T.get("dates"):
+        return T
+    k = 0
+    while k < len(T["dates"]) and T["dates"][k] < today:
+        k += 1
+    if k == 0:
+        return T
+    T = dict(T)
+    T["dates"] = T["dates"][k:]
+    T["partial"] = (T.get("partial") or [])[k:]
+    T["c"] = {c: [r[:2] + r[2 + k:] for r in rows] for c, rows in (T.get("c") or {}).items()}
+    return T
+
+
+def lt_towns(now, F, fc_issued, prev_lt):
+    """F-D0047-091 發布時間跟上一版鄉鎮資料相同 → 沿用（不下載 4.8 MB）；否則下載 F-D0047-093.zip"""
+    today = now.strftime("%Y-%m-%d")
+    pv = (prev_lt or {}).get("towns") if isinstance(prev_lt, dict) else None
+    if pv and pv.get("c") and fc_issued and pv.get("issued") == fc_issued and "zip" in F:
+        T = trim_towns(pv, today)
+        T = dict(T); T["reused"] = True
+        return T, None
+    if "zip" not in F:
+        return None, "未提供 zip 抓取函式"
+    try:
+        T = build_towns(F["zip"]("Forecast/F-D0047-093.zip"), today)
+        T["fetchedAt"] = iso(now)
+        return T, None
+    except Exception as e:
+        err = str(e)[:200]
+        if pv and pv.get("c"):
+            T = dict(trim_towns(pv, today)); T["cached"] = True; T["cacheReason"] = err
+            return T, err
+        return None, err
+
+
+def build_lowtemp(now, F, prev_lt=None):
     """回傳 lowtemp 區塊；觀測或預報任一份成功就輸出（另一份標 error）"""
     errors = {}
     docs = []
@@ -891,8 +1009,15 @@ def build_lowtemp(now, F):
             if d["date"] not in dates:
                 dates.append(d["date"])
     dates = sorted(dates)[:LT_DAYS]
+    fc_issued = iso(parse_t(fc_meta["issued"])) if fc_meta and fc_meta.get("issued") else None
+    t0 = time.time()
+    towns, terr = lt_towns(now, F, fc_issued, prev_lt)
+    if terr:
+        errors["F-D0047-093"] = terr
+    if towns is not None:
+        towns["sec"] = round(time.time() - t0, 1)
     state = "ok" if not errors and not missing else "partial"
-    return {"state": state, "updatedAt": iso(now),
+    return {"state": state, "towns": towns, "updatedAt": iso(now),
             "obs": {"sources": [s for s, _ in docs], "latest": max(obs_times) if obs_times else None,
                     "oldest": min(obs_times) if obs_times else None, "missing": missing},
             "forecast": ({"source": "F-D0047-091", "issued": iso(parse_t(fc_meta["issued"])) if fc_meta and fc_meta.get("issued") else None,
@@ -1118,7 +1243,7 @@ def fetch_light(now, F):
         errors["now"] = str(e)
     # v5.1 各縣市低溫（觀測＋一週預報）
     try:
-        out["lowtemp"] = build_lowtemp(now, F)
+        out["lowtemp"] = build_lowtemp(now, F, F.get("_prev_lowtemp"))
     except Exception as e:
         errors["lowtemp"] = str(e)[:300]
     # 上游 METAR
@@ -1148,13 +1273,16 @@ def default_fetchers():
         url = CWA_API + did + "?" + urllib.parse.urlencode({"Authorization": key, "format": "JSON"})
         return json.loads(http_get(url, timeout=40).decode("utf-8"))
 
+    def zf(path):
+        return http_get(S3 + path, timeout=120)
+
     def om(url):
         d = json.loads(http_get(url, timeout=90).decode("utf-8"))
         if isinstance(d, dict) and d.get("error"):
             raise RuntimeError("Open-Meteo：" + str(d.get("reason")))
         return d
 
-    return {"s3": s3, "cwa": cwa, "om": om, "json": lambda u: get_json(u, timeout=40),
+    return {"s3": s3, "zip": zf, "cwa": cwa, "om": om, "json": lambda u: get_json(u, timeout=40),
             "text": lambda u: http_get(u, timeout=60).decode("utf-8")}
 
 
@@ -1219,6 +1347,7 @@ def main(argv=None):
     if not clim:
         log("⚠️ 找不到 ERA5 氣候值檔（%s）→ 距平與季風指數留白" % a.clim)
     F = default_fetchers()
+    F["_prev_lowtemp"] = (prev or {}).get("lowtemp")
     heavy_ran = need_heavy(prev, now, a.force)
     heavy = fetch_heavy(now, clim, F) if heavy_ran else {}
     light = fetch_light(now, F)
