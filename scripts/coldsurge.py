@@ -2,6 +2,9 @@
 # -*- coding: utf-8 -*-
 """
 寒潮監測（tw-weather）→ site/data/coldsurge.json（schema "coldsurge-1.0"）
+v5.1（2026-11-18）：新增 lowtemp 區塊＝各縣市「現在溫度／今日最低（實測）／未來 7 天預報最低溫」
+  來源：氣象署 S3 公開鏡像 O-A0003-001（10 分鐘綜觀）＋O-A0001-001（自動站，逐時）＋F-D0047-091（縣市一週逐 12 小時預報）
+  全部免金鑰、每次執行都更新；抓不到就留 null（頁面顯示「—」），絕不補 0。
 
 資料（全部免費；只有低溫特報 W-C0033-004 需要 secrets.CWA_API_KEY，金鑰絕不印出）：
   氣象署 S3 公開鏡像：C-B0024-001（30 天測站逐日統計）、O-A0003-001（10 分鐘綜觀）、W-C0033-001（備援：縣市目前特報）
@@ -70,6 +73,21 @@ COUNTIES = ["基隆市", "臺北市", "新北市", "桃園市", "新竹市", "�
             "嘉義市", "嘉義縣", "臺南市", "高雄市", "屏東縣", "宜蘭縣", "花蓮縣", "臺東縣", "澎湖縣", "金門縣", "連江縣"]
 
 ATTR_OM = "模式資料：Open-Meteo（CC BY 4.0）；各模式版權屬原機構"
+
+# v5.1 各縣市代表測站（優先縣市政府所在地的平地測站；第一站沒資料才用下一站）
+#   46xxxx＝氣象署有人站（O-A0003-001，10 分鐘）；C0／C2／A0 等＝自動站（O-A0003-001 或 O-A0001-001）
+LT_STATIONS = [
+    ("基隆市", ["466940"]), ("臺北市", ["466920"]), ("新北市", ["C0AJ80", "466881"]), ("桃園市", ["C2C480", "467050"]),
+    ("新竹市", ["C0D660", "CAD050"]), ("新竹縣", ["467571"]), ("苗栗縣", ["C0E750", "467280"]), ("臺中市", ["467490"]),
+    ("彰化縣", ["A0G720", "467270"]), ("南投縣", ["C0I460"]), ("雲林縣", ["C0K400", "467290"]), ("嘉義市", ["467480"]),
+    ("嘉義縣", ["C0M680", "C2M920"]), ("臺南市", ["467410"]), ("高雄市", ["467441", "C0V890"]), ("屏東縣", ["C2R170", "467590"]),
+    ("宜蘭縣", ["467080"]), ("花蓮縣", ["466990"]), ("臺東縣", ["467660"]), ("澎湖縣", ["467350"]),
+    ("金門縣", ["467110"]), ("連江縣", ["467990"]),
+]
+LT_LOWLAND_M = 500.0                                   # 「縣內平地最低」只看海拔 < 500 m 的測站
+LT_EXCLUDE = {"彭佳嶼", "東沙島", "南沙島", "蘭嶼", "綠島", "東吉島"}   # 離島測站不代表本島縣市
+LT_OBS_MAX_AGE_H = 3.0                                 # 觀測超過 3 小時視為過期 → 留白
+LT_DAYS = 7
 
 
 def log(*a):
@@ -710,6 +728,180 @@ def oa3_now(doc):
     return out
 
 
+# ---------------------------------------------------------------- v5.1 各縣市低溫（觀測＋一週預報）
+def _st_list(doc):
+    return as_list((((doc or {}).get("cwaopendata") or {}).get("dataset") or {}).get("Station") or [])
+
+
+def _wgs84(geo):
+    for c in as_list((geo or {}).get("Coordinates") or []):
+        if c.get("CoordinateName") == "WGS84":
+            return num(c.get("StationLatitude")), num(c.get("StationLongitude"), lo=-181)
+    return None, None
+
+
+def obs_index(docs, now):
+    """O-A0003／O-A0001 → {StationId: 觀測}；同一站兩份都有時取觀測時間較新的。過期或日期不符的值一律留 None"""
+    today = now.strftime("%Y-%m-%d")
+    out = {}
+    for src, doc in docs:
+        for s in _st_list(doc):
+            sid = s.get("StationId")
+            if not sid:
+                continue
+            g = s.get("GeoInfo") or {}
+            w = s.get("WeatherElement") or {}
+            t_obs = parse_t((s.get("ObsTime") or {}).get("DateTime"))
+            lo = (((w.get("DailyExtreme") or {}).get("DailyLow") or {}).get("TemperatureInfo") or {})
+            lo_at = parse_t((lo.get("Occurred_at") or {}).get("DateTime"))
+            lat, lon = _wgs84(g)
+            fresh = t_obs is not None and 0 <= (now - t_obs).total_seconds() / 3600 <= LT_OBS_MAX_AGE_H
+            temp = num(w.get("AirTemperature")) if fresh else None
+            low = num(lo.get("AirTemperature")) if fresh else None
+            # 今日最低必須是今天（臺北時間）發生；跨日或時間缺漏 → 不採用
+            if low is not None and (lo_at is None or lo_at.astimezone(TPE).strftime("%Y-%m-%d") != today
+                                    or t_obs.astimezone(TPE).strftime("%Y-%m-%d") != today):
+                low = None
+            if temp is not None and not (-20 <= temp <= 45):
+                temp = None
+            if low is not None and not (-20 <= low <= 40):
+                low = None
+            rec = {"id": sid, "name": s.get("StationName"), "county": g.get("CountyName"), "town": g.get("TownName"),
+                   "alt": num(g.get("StationAltitude"), lo=-100), "lat": lat, "lon": lon, "src": src,
+                   "obsTime": iso(t_obs) if t_obs else None, "temp": temp, "low": low,
+                   "lowAt": iso(lo_at) if (low is not None and lo_at) else None}
+            old = out.get(sid)
+            if old is None or (rec["obsTime"] or "") > (old["obsTime"] or "") or (old["temp"] is None and rec["temp"] is not None):
+                out[sid] = rec
+    return out
+
+
+def county_lowland_min(idx, county):
+    best = None
+    for r in idx.values():
+        if r["county"] != county or r["low"] is None or r["name"] in LT_EXCLUDE:
+            continue
+        if r["alt"] is None or r["alt"] >= LT_LOWLAND_M:
+            continue
+        if best is None or r["low"] < best["low"]:
+            best = r
+    return None if best is None else {"low": best["low"], "id": best["id"], "name": best["name"], "town": best["town"],
+                                       "alt": best["alt"], "at": best["lowAt"]}
+
+
+def parse_week_min(doc):
+    """F-D0047-091 → (meta, {縣市: {"lat","lon","periods":[{start,end,min}]}})；缺值留 None"""
+    ds = ((doc or {}).get("cwaopendata") or {}).get("Dataset") or {}
+    info = ds.get("DatasetInfo") or {}
+    locs = as_list((ds.get("Locations") or {}).get("Location") or [])
+    if not locs:
+        raise ValueError("F-D0047-091 格式不符（無 Location）")
+    out = {}
+    for L in locs:
+        name = L.get("LocationName")
+        per = []
+        for we in as_list(L.get("WeatherElement") or []):
+            if we.get("ElementName") not in ("最低溫度", "MinTemperature"):
+                continue
+            for t in as_list(we.get("Time") or []):
+                ev = t.get("ElementValue") or {}
+                if isinstance(ev, list):
+                    ev = ev[0] if ev else {}
+                st, en = parse_t(t.get("StartTime")), parse_t(t.get("EndTime"))
+                if st is None:
+                    continue
+                v = num(ev.get("MinTemperature"))
+                per.append({"start": iso(st), "end": iso(en) if en else None, "min": v if v is None or -20 <= v <= 40 else None})
+        if name:
+            out[name] = {"lat": num(L.get("Latitude")), "lon": num(L.get("Longitude"), lo=-181), "periods": per}
+    meta = {"issued": info.get("IssueTime"), "update": info.get("Update"),
+            "validStart": (info.get("ValidTime") or {}).get("StartTime"), "validEnd": (info.get("ValidTime") or {}).get("EndTime")}
+    return meta, out
+
+
+def week_days(periods, today, ndays=LT_DAYS):
+    """依氣象署一週預報表排法：某日最低＝該日白天（06–18）與晚上（18–翌日06）兩時段最低溫的較低者。
+    只有一個時段（例如今天只剩晚上）→ partial=True；兩個時段都缺 → min=None"""
+    by = {}
+    for p in periods:
+        st = parse_t(p["start"]).astimezone(TPE)
+        d = st.strftime("%Y-%m-%d")
+        if d < today:
+            continue
+        slot = "night" if st.hour >= 18 or st.hour < 6 else "day"
+        if st.hour < 6:   # 00–06 起算的時段歸前一日晚上
+            d = (st - timedelta(hours=6)).strftime("%Y-%m-%d")
+            if d < today:
+                continue
+        by.setdefault(d, {})[slot] = p["min"]
+    days = []
+    for d in sorted(by)[:ndays]:
+        x = by[d]
+        vals = [v for v in (x.get("day"), x.get("night")) if v is not None]
+        days.append({"date": d, "min": min(vals) if vals else None, "day": x.get("day"), "night": x.get("night"),
+                     "partial": not ("day" in x and "night" in x)})
+    return days
+
+
+def build_lowtemp(now, F):
+    """回傳 lowtemp 區塊；觀測或預報任一份成功就輸出（另一份標 error）"""
+    errors = {}
+    docs = []
+    for path, src in (("Observation/O-A0003-001.json", "O-A0003-001"), ("Observation/O-A0001-001.json", "O-A0001-001")):
+        try:
+            docs.append((src, F["s3"](path)))
+        except Exception as e:
+            errors[src] = str(e)[:200]
+    idx = obs_index(docs, now) if docs else {}
+    fc_meta, fc = None, {}
+    try:
+        fc_meta, fc = parse_week_min(F["s3"]("Forecast/F-D0047-091.json"))
+    except Exception as e:
+        errors["F-D0047-091"] = str(e)[:200]
+    if not idx and not fc:
+        raise RuntimeError("觀測與預報都抓取失敗：" + "; ".join("%s=%s" % kv for kv in errors.items()))
+    today = now.strftime("%Y-%m-%d")
+    rows, obs_times, missing = [], [], []
+    for county, sids in LT_STATIONS:
+        r = None
+        for sid in sids:
+            c = idx.get(sid)
+            if c and (c["temp"] is not None or c["low"] is not None):
+                r = c
+                break
+        if r is None:
+            r = next((idx[s] for s in sids if s in idx), None)
+        if r is None or (r["temp"] is None and r["low"] is None):
+            missing.append(county)
+        if r and r["obsTime"]:
+            obs_times.append(r["obsTime"])
+        f = fc.get(county)
+        days = week_days(f["periods"], today) if f else []
+        rows.append({"county": county,
+                     "station": ({"id": r["id"], "name": r["name"], "town": r["town"], "alt": r["alt"], "lat": r["lat"], "lon": r["lon"],
+                                  "src": r["src"]} if r else {"id": sids[0], "name": None}),
+                     "obsTime": r["obsTime"] if r else None,
+                     "temp": r["temp"] if r else None, "low": r["low"] if r else None, "lowAt": r["lowAt"] if r else None,
+                     "countyLow": county_lowland_min(idx, county),
+                     "fcLat": f["lat"] if f else None, "fcLon": f["lon"] if f else None,
+                     "days": days})
+    dates = []
+    for r in rows:
+        for d in r["days"]:
+            if d["date"] not in dates:
+                dates.append(d["date"])
+    dates = sorted(dates)[:LT_DAYS]
+    state = "ok" if not errors and not missing else "partial"
+    return {"state": state, "updatedAt": iso(now),
+            "obs": {"sources": [s for s, _ in docs], "latest": max(obs_times) if obs_times else None,
+                    "oldest": min(obs_times) if obs_times else None, "missing": missing},
+            "forecast": ({"source": "F-D0047-091", "issued": iso(parse_t(fc_meta["issued"])) if fc_meta and fc_meta.get("issued") else None,
+                          "update": iso(parse_t(fc_meta["update"])) if fc_meta and fc_meta.get("update") else None,
+                          "dates": dates} if fc else {"source": "F-D0047-091", "state": "error", "dates": []}),
+            "thresholds": [14, 12, 10, 6],
+            "rows": rows, "errors": errors or None}
+
+
 # ---------------------------------------------------------------- 組裝
 def load_json(path):
     try:
@@ -924,6 +1116,11 @@ def fetch_light(now, F):
         out["now"] = {"state": "ok", "updatedAt": iso(now), "stations": oa3_now(F["s3"]("Observation/O-A0003-001.json"))}
     except Exception as e:
         errors["now"] = str(e)
+    # v5.1 各縣市低溫（觀測＋一週預報）
+    try:
+        out["lowtemp"] = build_lowtemp(now, F)
+    except Exception as e:
+        errors["lowtemp"] = str(e)[:300]
     # 上游 METAR
     try:
         ids = ",".join([u[0] for u in UPSTREAM])
@@ -982,7 +1179,7 @@ def assemble(prev, heavy, light, now, heavy_ran):
             doc[b] = (prev or {}).get(b)
         doc["heavyAt"] = (prev or {}).get("heavyAt")
         doc["heavyErrors"] = (prev or {}).get("heavyErrors")
-    for b in ("warning", "now", "upstream"):
+    for b in ("warning", "now", "upstream", "lowtemp"):
         v = light.get(b)
         if v is None:
             v = keep_prev(prev, b, "本次抓取失敗", now) if b != "warning" else {"state": "unavailable", "counties": [], "updatedAt": iso(now)}
